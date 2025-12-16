@@ -1,0 +1,318 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from . import data as data_lib
+from .utils import ensure_dir, save_run_config, set_seed
+
+
+DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+
+
+@dataclass(frozen=True, slots=True)
+class TrainArgs:
+    model_name: str = DEFAULT_MODEL
+    train_path: str = ""
+    valid_path: Optional[str] = None
+    output_dir: str = "outputs/lora"
+    max_seq_length: int = 2048
+    per_device_train_batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+    lr: float = 2e-4
+    num_train_epochs: float = 1.0
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    use_4bit: bool = False
+    seed: int = 0
+    eval_steps: int = 200
+    save_steps: int = 200
+    logging_steps: int = 20
+    warmup_ratio: float = 0.03
+    report_to: str = "none"
+
+
+def _make_peft_config(args: TrainArgs):
+    from peft import LoraConfig
+
+    # Reasonable default for Qwen-family decoder blocks.
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    return LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target_modules,
+    )
+
+
+def _load_model_and_tokenizer(args: TrainArgs):
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    quant_cfg = None
+    if args.use_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
+            )
+        except Exception as e:
+            raise RuntimeError("use_4bit requires bitsandbytes + BitsAndBytesConfig") from e
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        trust_remote_code=True,
+        torch_dtype="auto",
+        quantization_config=quant_cfg,
+        device_map="auto" if args.use_4bit else None,
+    )
+    return model, tok
+
+
+def _chat_to_text(tok, messages: List[Dict[str, str]]) -> str:
+    return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+
+
+def train_sft_lora(args: TrainArgs) -> None:
+    set_seed(args.seed)
+    ensure_dir(args.output_dir)
+
+    # Validate contract early for fail-fast UX.
+    data_lib.validate_dataset_contract_jsonl(args.train_path)
+    if args.valid_path:
+        data_lib.validate_dataset_contract_jsonl(args.valid_path)
+
+    from datasets import load_dataset
+    from peft import get_peft_model, prepare_model_for_kbit_training
+    from transformers import TrainingArguments
+
+    model, tok = _load_model_and_tokenizer(args)
+
+    if args.use_4bit:
+        model = prepare_model_for_kbit_training(model)
+
+    model.gradient_checkpointing_enable()
+
+    peft_cfg = _make_peft_config(args)
+    model = get_peft_model(model, peft_cfg)
+
+    train_ds = load_dataset("json", data_files=args.train_path, split="train")
+    eval_ds = None
+    if args.valid_path:
+        eval_ds = load_dataset("json", data_files=args.valid_path, split="train")
+
+    def to_messages(batch):
+        msgs = []
+        for i in range(len(batch["id"])):
+            ex = data_lib.DatasetExample(
+                id=batch["id"][i],
+                instruction=batch["instruction"][i],
+                input=batch["input"][i],
+                output=batch["output"][i],
+            )
+            msgs.append(data_lib.dataset_contract_to_qwen_chat_messages(ex)["messages"])
+        return {"messages": msgs}
+
+    train_ds = train_ds.map(to_messages, batched=True, remove_columns=train_ds.column_names)
+    if eval_ds is not None:
+        eval_ds = eval_ds.map(to_messages, batched=True, remove_columns=eval_ds.column_names)
+
+    def formatting_func(examples):
+        """
+        TRL calls formatting_func either:
+          - batched: examples["messages"] is List[List[Dict[str,str]]]
+          - unbatched: examples["messages"] is List[Dict[str,str]] (single conversation)
+        """
+        msgs = examples["messages"]
+        # Unbatched: one conversation = list of role/content dicts.
+        if isinstance(msgs, list) and (len(msgs) == 0 or isinstance(msgs[0], dict)):
+            return _chat_to_text(tok, msgs)
+        # Batched: list of conversations.
+        return [_chat_to_text(tok, m) for m in msgs]
+
+    try:
+        from trl import SFTTrainer
+    except Exception as e:
+        raise RuntimeError("trl is required for SFT training") from e
+
+    # Transformers renamed `evaluation_strategy` -> `eval_strategy` in newer versions.
+    # Keep compatibility across environments by trying the new kw first, then falling back.
+    eval_strategy = "steps" if eval_ds is not None else "no"
+    targs_kwargs = dict(
+        output_dir=args.output_dir,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.lr,
+        num_train_epochs=args.num_train_epochs,
+        save_steps=args.save_steps,
+        logging_steps=args.logging_steps,
+        warmup_ratio=args.warmup_ratio,
+        report_to=args.report_to,
+        fp16=True,
+        bf16=False,
+        remove_unused_columns=False,
+    )
+    if eval_ds is not None:
+        targs_kwargs["eval_steps"] = args.eval_steps
+    try:
+        targs = TrainingArguments(eval_strategy=eval_strategy, **targs_kwargs)
+    except TypeError:
+        # Older transformers
+        targs = TrainingArguments(evaluation_strategy=eval_strategy, **targs_kwargs)
+
+    # TRL's SFTTrainer API has changed across versions (tokenizer -> processing_class,
+    # max_seq_length -> max_length, packing added/removed, etc). Build kwargs based on
+    # the installed signature to keep compatibility across environments.
+    import inspect
+
+    sig = inspect.signature(SFTTrainer.__init__)
+
+    # Always-required-ish fields for our usage.
+    candidate_kwargs: Dict[str, Any] = {
+        "model": model,
+        "train_dataset": train_ds,
+        "eval_dataset": eval_ds,
+        "formatting_func": formatting_func,
+        "args": targs,
+    }
+
+    # Tokenizer / processing class naming differs by TRL version.
+    if "tokenizer" in sig.parameters:
+        candidate_kwargs["tokenizer"] = tok
+    elif "processing_class" in sig.parameters:
+        candidate_kwargs["processing_class"] = tok
+    else:
+        raise RuntimeError("Unsupported trl.SFTTrainer API (no tokenizer/processing_class parameter found)")
+
+    # Sequence length naming differs by TRL version.
+    if "max_seq_length" in sig.parameters:
+        candidate_kwargs["max_seq_length"] = args.max_seq_length
+    elif "max_length" in sig.parameters:
+        candidate_kwargs["max_length"] = args.max_seq_length
+
+    # Packing is optional and not supported in all versions.
+    if "packing" in sig.parameters:
+        candidate_kwargs["packing"] = True
+
+    # Filter only kwargs supported by the installed TRL signature.
+    sft_kwargs = {k: v for k, v in candidate_kwargs.items() if k in sig.parameters}
+
+    trainer = SFTTrainer(**sft_kwargs)
+    trainer.train()
+
+    model.save_pretrained(args.output_dir)
+    tok.save_pretrained(args.output_dir)
+    save_run_config(os.path.join(args.output_dir, "run_config.json"), args)
+
+
+def merge_lora(base_model_name: str, adapter_dir: str, output_dir: str) -> None:
+    ensure_dir(output_dir)
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    tok = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(base_model_name, trust_remote_code=True, torch_dtype="auto")
+    model = PeftModel.from_pretrained(model, adapter_dir)
+    merged = model.merge_and_unload()
+    merged.save_pretrained(output_dir, safe_serialization=True)
+    tok.save_pretrained(output_dir)
+
+
+def smoke_train_step() -> None:
+    """
+    CPU-only smoke check: tiny random LM forward/backward + optimizer step.
+    Avoids any HF downloads (network-restricted environments).
+    """
+    import torch
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    cfg = GPT2Config(
+        vocab_size=128,
+        n_positions=64,
+        n_embd=32,
+        n_layer=2,
+        n_head=2,
+    )
+    model = GPT2LMHeadModel(cfg)
+    model.train()
+
+    # Fake token batch.
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 32))
+    labels = input_ids.clone()
+
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    out = model(input_ids=input_ids, labels=labels)
+    loss = out.loss
+    loss.backward()
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_name", type=str, default=DEFAULT_MODEL)
+    ap.add_argument("--train_path", type=str, required=True)
+    ap.add_argument("--valid_path", type=str, default=None)
+    ap.add_argument("--output_dir", type=str, required=True)
+    ap.add_argument("--max_seq_length", type=int, default=2048)
+    ap.add_argument("--per_device_train_batch_size", type=int, default=1)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--num_train_epochs", type=float, default=1.0)
+    ap.add_argument("--lora_r", type=int, default=16)
+    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_dropout", type=float, default=0.05)
+    ap.add_argument("--use_4bit", action="store_true")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--eval_steps", type=int, default=200)
+    ap.add_argument("--save_steps", type=int, default=200)
+    ap.add_argument("--logging_steps", type=int, default=20)
+    ap.add_argument("--warmup_ratio", type=float, default=0.03)
+    ap.add_argument("--report_to", type=str, default="none")
+    args = ap.parse_args()
+
+    train_sft_lora(
+        TrainArgs(
+            model_name=args.model_name,
+            train_path=args.train_path,
+            valid_path=args.valid_path,
+            output_dir=args.output_dir,
+            max_seq_length=args.max_seq_length,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            lr=args.lr,
+            num_train_epochs=args.num_train_epochs,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            use_4bit=args.use_4bit,
+            seed=args.seed,
+            eval_steps=args.eval_steps,
+            save_steps=args.save_steps,
+            logging_steps=args.logging_steps,
+            warmup_ratio=args.warmup_ratio,
+            report_to=args.report_to,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
+
