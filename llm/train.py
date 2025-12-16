@@ -156,7 +156,7 @@ def train_sft_lora(args: TrainArgs) -> None:
         return [_chat_to_text(tok, m) for m in msgs]
 
     try:
-        try:
+    try:
             from trl import SFTTrainer  # type: ignore[attr-defined]
         except Exception:
             from trl.trainer.sft_trainer import SFTTrainer  # type: ignore
