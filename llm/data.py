@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
 
 from .utils import json_loads_strict
 
@@ -18,7 +18,7 @@ class DatasetExample:
     output: str  # must parse as JSON
 
 
-def _fail(path: str, line_no: int, msg: str) -> None:
+def _fail(path: str, line_no: int, msg: str) -> NoReturn:
     raise ValueError(f"{path}:{line_no}: {msg}")
 
 
@@ -28,6 +28,7 @@ def iter_jsonl(path: str) -> Iterator[Tuple[int, Dict]]:
             line = line.strip()
             if not line:
                 continue
+            obj: Dict
             try:
                 obj = json.loads(line)
             except Exception as e:

@@ -4,10 +4,16 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from . import data as data_lib
 from .utils import ensure_dir, save_run_config, set_seed
+
+if TYPE_CHECKING:
+    # Optional dependency; only needed when training with LoRA.
+    from peft import LoraConfig  # type: ignore[import]
+    from peft import PeftModel  # type: ignore[import]
+    from peft import get_peft_model, prepare_model_for_kbit_training  # type: ignore[import]
 
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
@@ -37,7 +43,7 @@ class TrainArgs:
 
 
 def _make_peft_config(args: TrainArgs):
-    from peft import LoraConfig
+    from peft import LoraConfig  # type: ignore[import]
 
     # Reasonable default for Qwen-family decoder blocks.
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -97,7 +103,7 @@ def train_sft_lora(args: TrainArgs) -> None:
         data_lib.validate_dataset_contract_jsonl(args.valid_path)
 
     from datasets import load_dataset
-    from peft import get_peft_model, prepare_model_for_kbit_training
+    from peft import get_peft_model, prepare_model_for_kbit_training  # type: ignore[import]
     from transformers import TrainingArguments
 
     model, tok = _load_model_and_tokenizer(args)
@@ -127,9 +133,14 @@ def train_sft_lora(args: TrainArgs) -> None:
             msgs.append(data_lib.dataset_contract_to_qwen_chat_messages(ex)["messages"])
         return {"messages": msgs}
 
-    train_ds = train_ds.map(to_messages, batched=True, remove_columns=train_ds.column_names)
+    # Datasets types can be loose; cast column names to list for type-checkers.
+    from typing import cast
+
+    train_cols = cast(List[str], list(train_ds.column_names or []))
+    train_ds = train_ds.map(to_messages, batched=True, remove_columns=train_cols)
     if eval_ds is not None:
-        eval_ds = eval_ds.map(to_messages, batched=True, remove_columns=eval_ds.column_names)
+        eval_cols = cast(List[str], list(eval_ds.column_names or []))
+        eval_ds = eval_ds.map(to_messages, batched=True, remove_columns=eval_cols)
 
     def formatting_func(examples):
         """
@@ -145,7 +156,10 @@ def train_sft_lora(args: TrainArgs) -> None:
         return [_chat_to_text(tok, m) for m in msgs]
 
     try:
-        from trl import SFTTrainer
+        try:
+            from trl import SFTTrainer  # type: ignore[attr-defined]
+        except Exception:
+            from trl.trainer.sft_trainer import SFTTrainer  # type: ignore
     except Exception as e:
         raise RuntimeError("trl is required for SFT training") from e
 
@@ -169,10 +183,10 @@ def train_sft_lora(args: TrainArgs) -> None:
     if eval_ds is not None:
         targs_kwargs["eval_steps"] = args.eval_steps
     try:
-        targs = TrainingArguments(eval_strategy=eval_strategy, **targs_kwargs)
+        targs = TrainingArguments(eval_strategy=eval_strategy, **targs_kwargs)  # type: ignore[arg-type]
     except TypeError:
         # Older transformers
-        targs = TrainingArguments(evaluation_strategy=eval_strategy, **targs_kwargs)
+        targs = TrainingArguments(evaluation_strategy=eval_strategy, **targs_kwargs)  # type: ignore[arg-type]
 
     # TRL's SFTTrainer API has changed across versions (tokenizer -> processing_class,
     # max_seq_length -> max_length, packing added/removed, etc). Build kwargs based on
@@ -211,7 +225,7 @@ def train_sft_lora(args: TrainArgs) -> None:
     # Filter only kwargs supported by the installed TRL signature.
     sft_kwargs = {k: v for k, v in candidate_kwargs.items() if k in sig.parameters}
 
-    trainer = SFTTrainer(**sft_kwargs)
+    trainer = SFTTrainer(**sft_kwargs)  # type: ignore[call-arg]
     trainer.train()
 
     model.save_pretrained(args.output_dir)
@@ -222,7 +236,7 @@ def train_sft_lora(args: TrainArgs) -> None:
 def merge_lora(base_model_name: str, adapter_dir: str, output_dir: str) -> None:
     ensure_dir(output_dir)
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import PeftModel
+    from peft import PeftModel  # type: ignore[import]
 
     tok = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
     if tok.pad_token is None:

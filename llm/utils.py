@@ -45,7 +45,8 @@ def ensure_dir(path: str) -> None:
 
 
 def _jsonable(obj: Any) -> Any:
-    if is_dataclass(obj):
+    # asdict expects a dataclass *instance* (not the class itself).
+    if is_dataclass(obj) and not isinstance(obj, type):
         return asdict(obj)
     if hasattr(obj, "__dict__"):
         return dict(obj.__dict__)

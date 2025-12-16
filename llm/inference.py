@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Optional dependency; imported at runtime only when adapter_path is provided.
+    from peft import PeftModel  # type: ignore[import]  # pragma: no cover
 
 from .utils import json_loads_strict, set_seed
 
@@ -37,7 +41,7 @@ def _load_model_and_tokenizer(cfg: InferenceConfig):
     model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype="auto")
 
     if cfg.adapter_path:
-        from peft import PeftModel
+        from peft import PeftModel  # type: ignore[import]
 
         model = PeftModel.from_pretrained(model, cfg.adapter_path)
 
