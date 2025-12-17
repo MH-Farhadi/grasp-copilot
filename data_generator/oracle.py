@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -7,265 +8,212 @@ from . import grid
 from . import yaw as yawlib
 
 
-def _normalize_label(text: str) -> str:
-    # Accept underscores/spaces and case-insensitive matches.
-    return text.strip().lower().replace(" ", "_")
-
-
-def _extract_user_label(dialog: Sequence[Dict], valid_labels: Sequence[str]) -> Optional[str]:
-    valid = {_normalize_label(l): l for l in valid_labels}
-    # Search most recent user messages first.
-    for msg in reversed(dialog):
-        if msg.get("role") != "user":
-            continue
-        norm = _normalize_label(msg.get("content", ""))
-        if norm in valid:
-            return valid[norm]
-    return None
-
-
 @dataclass
 class OracleState:
+    intended_obj_id: str
     selected_obj_id: Optional[str] = None
-    just_guide: bool = False
-    last_user_selection_label: Optional[str] = None
-    pending_user_prompt: Optional[str] = None  # "ambiguity" or "takeover"
-    pending_ambiguity_choices: Optional[Tuple[str, str]] = None  # labels
-    pending_takeover_obj_id: Optional[str] = None
-    # After the user accepts takeover, suppress re-offering takeover for a few steps
-    # so the oracle proceeds with action tool calls (matches the spec's intent).
-    takeover_cooldown_steps: int = 0
-    outcomes: List[str] = field(default_factory=list)  # previous outcomes (t-1 ...), includes "none"
+    pending_action_obj_id: Optional[str] = None
+    awaiting_confirmation: bool = False
+    awaiting_help: bool = False
+    awaiting_choice: bool = False
+    last_prompt_context: Optional[Dict] = None
+    # Track recent user rejections to avoid asking the exact same question in a loop.
+    last_declined_obj_id: Optional[str] = None
+    last_tool_calls: List[str] = field(default_factory=list)
 
 
-def _maybe_apply_takeover_reply(dialog: Sequence[Dict], state: OracleState) -> None:
+def _tool(tool: str, args: Dict) -> Dict:
+    return {"tool": tool, "args": args}
+
+
+def _interact(kind: str, text: str, choices: List[str], context: Dict, state: OracleState) -> Dict:
+    state.last_prompt_context = context
+    return _tool("INTERACT", {"kind": kind, "text": text, "choices": choices})
+
+
+def _top_two_candidates(objects: Sequence[Dict], candidates: Sequence[str], gripper_cell: str) -> Optional[List[Dict]]:
+    available = [o for o in objects if o["id"] in set(candidates) and not o["is_held"]]
+    if len(available) < 2:
+        return None
+    scored = [(o, grid.manhattan(gripper_cell, o["cell"])) for o in available]
+    scored.sort(key=lambda x: (x[1], x[0]["id"]))
+    return [scored[0][0], scored[1][0]]
+
+
+def _has_yaw_oscillation(gripper_hist: Sequence[Dict]) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
-    Detect a user reply to the most recent takeover offer and update state.
-
-    Generator uses fixed strings ("yes please" / "no, just guide"), but we accept
-    simple substrings to keep it robust and deterministic.
+    Returns (triggered, cell, yaw1, yaw2) to support yaw-struggle prompts.
     """
-    if len(dialog) < 2:
-        return
-    last, prev = dialog[-1], dialog[-2]
-    if last.get("role") != "user" or prev.get("role") != "assistant":
-        return
-    prev_txt = str(prev.get("content", "")).lower()
-    if "take over" not in prev_txt and "takeover" not in prev_txt:
-        return
-    user_txt = str(last.get("content", "")).strip().lower()
-    if "no" in user_txt:
-        state.just_guide = True
-        return
-    if "yes" in user_txt:
-        state.just_guide = False
-        state.takeover_cooldown_steps = max(state.takeover_cooldown_steps, 3)
+    if len(gripper_hist) < 6:
+        return False, None, None, None
+    cells = [g["cell"] for g in gripper_hist]
+    yaws = [g["yaw"] for g in gripper_hist]
+    cell_counts = Counter(cells)
+    dominant_cell, count = cell_counts.most_common(1)[0]
+    if count < 4:
+        return False, None, None, None
+
+    # Track yaw switches to see if we bounce between two bins.
+    unique_order: List[str] = []
+    for y in yaws:
+        if not unique_order or unique_order[-1] != y:
+            unique_order.append(y)
+    if len(set(unique_order)) != 2:
+        return False, None, None, None
+    switches = sum(1 for i in range(1, len(yaws)) if yaws[i] != yaws[i - 1])
+    if switches < 3:
+        return False, None, None, None
+    yaw1, yaw2 = unique_order[0], unique_order[1]
+    return True, dominant_cell, yaw1, yaw2
 
 
-def _score_objects(obs: Dict) -> Dict[str, int]:
-    objects = [o for o in obs["objects"] if not o["is_held"]]
-    candidates = set(obs["candidates"])
-    objects = [o for o in objects if o["id"] in candidates]
+def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], memory: Dict, state: OracleState) -> Dict:
+    current_cell = gripper_hist[-1]["cell"]
+    candidates = list(memory.get("candidates", []))
+    objects_by_id = {o["id"]: o for o in objects}
+    current_yaw = gripper_hist[-1]["yaw"]
 
-    recent_cell = obs["gripper_hist"][-1]["cell"]
-    prev_cell = obs["gripper_hist"][-2]["cell"]
+    # Follow-up action after user confirmed help/approach.
+    if state.pending_action_obj_id is not None and state.pending_action_obj_id in objects_by_id:
+        target = objects_by_id[state.pending_action_obj_id]
+        if current_cell != target["cell"]:
+            return _tool("APPROACH", {"obj": target["id"]})
+        if current_yaw != target["yaw"]:
+            return _tool("ALIGN_YAW", {"obj": target["id"]})
+        # Completed the pending action; clear selection to avoid re-confirm loops.
+        state.pending_action_obj_id = None
+        state.selected_obj_id = None
+        state.awaiting_confirmation = False
+        state.awaiting_choice = False
+        state.awaiting_help = False
 
-    # Pre-compute 2 nearest by grid distance (ties broken deterministically by obj_id).
-    dist_items = [(o["id"], grid.manhattan(recent_cell, o["cell"])) for o in objects]
-    dist_items.sort(key=lambda x: (x[1], x[0]))
-    nearest2 = {oid for oid, _ in dist_items[:2]}
+    # If we're waiting for a user reply, keep prompting (don't fall through to motion tools).
+    if state.awaiting_confirmation:
+        obj_id = state.selected_obj_id or state.intended_obj_id
+        obj = objects_by_id.get(obj_id)
+        if obj:
+            question = f"Do you want me to approach the {obj['label']}?"
+            choices = ["1) YES", "2) NO"]
+            context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"]}
+            return _interact("CONFIRM", question, choices, context, state)
+        state.awaiting_confirmation = False
 
-    scores: Dict[str, int] = {o["id"]: 0 for o in objects}
-    for o in objects:
-        oid = o["id"]
-        if o["cell"] == recent_cell:
-            scores[oid] += 2
-        if o["cell"] == prev_cell:
-            scores[oid] += 1
-        if grid.same_row_or_col(o["cell"], recent_cell):
-            scores[oid] += 1
-        if oid in nearest2:
-            scores[oid] += 1
-    return scores
-
-
-def _top2(scores: Dict[str, int]) -> List[Tuple[str, int]]:
-    items = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
-    return items[:2]
-
-
-def _tool(tool_name: str, arguments: Dict) -> Dict:
-    return {"tool_name": tool_name, "arguments": arguments}
-
-
-def _interact(type_: str, text: str, choices: Optional[List[str]] = None) -> Dict:
-    args: Dict = {"type": type_, "text": text}
-    if choices is not None:
-        args["choices"] = choices
-    return _tool("INTERACT", args)
-
-
-def oracle_decide_tool(obs: Dict, dialog: Sequence[Dict], state: OracleState) -> Dict:
-    # If user previously requested "take over", exit just-guide mode.
-    for msg in reversed(dialog):
-        if msg.get("role") != "user":
-            continue
-        txt = msg.get("content", "").lower()
-        if "take over" in txt or "takeover" in txt:
-            state.just_guide = False
-            break
-
-    # If user just responded to a takeover offer, reflect that here.
-    _maybe_apply_takeover_reply(dialog, state)
-    if state.takeover_cooldown_steps > 0:
-        # Consume one step immediately so it applies to this decision too.
-        state.takeover_cooldown_steps -= 1
-
-    # "Just guide" episodes: only coach unless user asked to take over.
-    if state.just_guide:
-        scores = _score_objects(obs)
-        top = _top2(scores)
-        hint = "I can guide you—move toward the likely target."
-        if top:
-            obj_id, _ = top[0]
-            label = next(o["label"] for o in obs["objects"] if o["id"] == obj_id)
-            cell = next(o["cell"] for o in obs["objects"] if o["id"] == obj_id)
-            hint = f"I think it's the {label}; move the gripper to {cell} and lower to LOW."
-        return _interact("coach", hint)
-
-    # Direct user selection override (only when it's new or changes the current selection).
-    user_label = _extract_user_label(dialog, [o["label"] for o in obs["objects"]])
-    if user_label is not None and user_label != state.last_user_selection_label:
-        state.last_user_selection_label = user_label
-        for o in obs["objects"]:
-            if not o["is_held"] and o["label"] == user_label and o["id"] in set(obs["candidates"]):
-                if state.selected_obj_id != o["id"]:
-                    state.selected_obj_id = o["id"]
-                    return _tool("SELECT_TARGET", {"obj_id": o["id"]})
-
-    # Rule 1.
-    if obs["last_action_outcome"] == "grasp_success":
-        # Clear selection if it's now held.
-        if state.selected_obj_id is not None:
-            held = next((o for o in obs["objects"] if o["id"] == state.selected_obj_id), None)
-            if held and held["is_held"]:
-                state.selected_obj_id = None
-        return _interact("notify", "Got it.")
-
-    scores = _score_objects(obs)
-    top2 = _top2(scores)
-    candidates = set(obs["candidates"])
-
-    # Rule 2: ambiguity.
-    if state.selected_obj_id is None and len(top2) == 2:
-        (a_id, a_s), (b_id, b_s) = top2
-        if abs(a_s - b_s) <= 1 and a_id in candidates and b_id in candidates:
-            a_label = next(o["label"] for o in obs["objects"] if o["id"] == a_id)
-            b_label = next(o["label"] for o in obs["objects"] if o["id"] == b_id)
-            return _interact(
-                "question",
-                "Which object should I help with?",
-                choices=[a_label, b_label],
+    if state.awaiting_choice:
+        top_two = _top_two_candidates(objects, candidates, current_cell)
+        if top_two:
+            a, b = top_two
+            text = (
+                f"I notice you are approaching the {a['label']}. "
+                f"However, {b['label']} is also close. Which one do you want to grasp?"
             )
+            choices = [f"1) {a['label']}", f"2) {b['label']}"]
+            context = {"type": "candidate_question", "labels": [a["label"], b["label"]]}
+            return _interact("QUESTION", text, choices, context, state)
+        state.awaiting_choice = False
 
-    # Rule 3: struggle detection.
-    gh = obs["gripper_hist"]
-    if len(gh) >= 3:
-        same_cell_3 = gh[-1]["cell"] == gh[-2]["cell"] == gh[-3]["cell"]
-        yaw_changed_twice = gh[-1]["yaw_bin"] != gh[-2]["yaw_bin"] and gh[-2]["yaw_bin"] != gh[-3]["yaw_bin"]
-        oscillating = same_cell_3 and yaw_changed_twice
-    else:
-        oscillating = False
+    if state.awaiting_help:
+        # Re-ask the help prompt if we are still in a yaw-struggle state.
+        triggered, dom_cell, yaw1, yaw2 = _has_yaw_oscillation(gripper_hist)
+        if triggered:
+            target_obj = next((o for o in objects if o["cell"] == dom_cell), None)
+            if target_obj and target_obj["yaw"] not in {yaw1, yaw2}:
+                text = (
+                    f"It looks like you are trying to align to the {target_obj['label']} at {dom_cell}, "
+                    f"but the gripper yaw keeps changing ({yaw1} and {yaw2}) instead of matching the object yaw "
+                    f"({target_obj['yaw']}). Do you want me to help?"
+                )
+                choices = ["1) YES", "2) NO"]
+                context = {"type": "help", "obj_id": target_obj["id"], "yaws": (yaw1, yaw2, target_obj["yaw"])}
+                return _interact("SUGGESTION", text, choices, context, state)
+        state.awaiting_help = False
 
-    recent_outcomes = list(state.outcomes[-5:])
-    # state.outcomes includes the previous step outcome; ensure we count current obs outcome too.
-    if not recent_outcomes or recent_outcomes[-1] != obs["last_action_outcome"]:
-        recent_outcomes.append(obs["last_action_outcome"])
-    fail_count = sum(1 for o in recent_outcomes if o in {"missed_contact", "grasp_fail"})
-    if (oscillating or fail_count >= 2) and state.takeover_cooldown_steps == 0:
-        return _interact("offer_takeover", "Want me to align yaw / take over?")
+    # Confirmation after a user-picked object.
+    if state.selected_obj_id is not None and not state.awaiting_confirmation:
+        obj = objects_by_id.get(state.selected_obj_id)
+        if obj:
+            state.awaiting_confirmation = True
+            question = f"Do you want me to approach the {obj['label']}?"
+            choices = ["1) YES", "2) NO"]
+            context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"]}
+            return _interact("CONFIRM", question, choices, context, state)
 
-    # Rule 4: select if none.
-    if state.selected_obj_id is None or state.selected_obj_id not in candidates:
-        if not top2:
-            return _interact("notify", "No candidates available.")
-        state.selected_obj_id = top2[0][0]
-        return _tool("SELECT_TARGET", {"obj_id": state.selected_obj_id})
+    # Candidate clarification when approach evidence is similar.
+    top_two = _top_two_candidates(objects, candidates, current_cell)
+    if top_two and not state.awaiting_choice and not state.awaiting_confirmation:
+        a, b = top_two
+        dist_a = grid.manhattan(current_cell, a["cell"])
+        dist_b = grid.manhattan(current_cell, b["cell"])
+        if abs(dist_a - dist_b) <= 1:
+            text = (
+                f"I notice you are approaching the {a['label']}. "
+                f"However, {b['label']} is also close. Which one do you want to grasp?"
+            )
+            choices = [f"1) {a['label']}", f"2) {b['label']}"]
+            context = {"type": "candidate_question", "labels": [a["label"], b["label"]]}
+            state.awaiting_choice = True
+            return _interact("QUESTION", text, choices, context, state)
 
-    target_id = state.selected_obj_id
-    target = next(o for o in obs["objects"] if o["id"] == target_id)
-    gcur = obs["gripper_hist"][-1]
+    # Yaw struggle suggestion.
+    triggered, dom_cell, yaw1, yaw2 = _has_yaw_oscillation(gripper_hist)
+    if triggered and not state.awaiting_help:
+        target_obj = next((o for o in objects if o["cell"] == dom_cell), None)
+        if target_obj and target_obj["yaw"] not in {yaw1, yaw2}:
+            text = (
+                f"It looks like you are trying to align to the {target_obj['label']} at {dom_cell}, "
+                f"but the gripper yaw keeps changing ({yaw1} and {yaw2}) instead of matching the object yaw "
+                f"({target_obj['yaw']}). Do you want me to help?"
+            )
+            choices = ["1) YES", "2) NO"]
+            context = {"type": "help", "obj_id": target_obj["id"], "yaws": (yaw1, yaw2, target_obj["yaw"])}
+            state.awaiting_help = True
+            return _interact("SUGGESTION", text, choices, context, state)
 
-    # Rule 5: approach.
-    if gcur["cell"] != target["cell"]:
-        return _tool("APPROACH", {"obj_id": target_id, "mode": "topdown", "hover": "HIGH"})
+    # Default policy: move toward the intended object or align yaw when co-located.
+    intended = objects_by_id[state.intended_obj_id]
+    if current_cell != intended["cell"]:
+        return _tool("APPROACH", {"obj": intended["id"]})
+    if current_yaw != intended["yaw"]:
+        return _tool("ALIGN_YAW", {"obj": intended["id"]})
 
-    # Rule 6: align yaw.
-    if gcur["yaw_bin"] != target["yaw_bin"]:
-        return _tool("ALIGN_YAW", {"obj_id": target_id, "yaw_bin": target["yaw_bin"]})
+    # If already aligned and close, gently re-confirm intent.
+    if not state.awaiting_confirmation:
+        state.awaiting_confirmation = True
+        text = f"Do you want me to approach the {intended['label']}?"
+        choices = ["1) YES", "2) NO"]
+        context = {"type": "confirm", "obj_id": intended["id"], "label": intended["label"]}
+        return _interact("CONFIRM", text, choices, context, state)
 
-    # Rule 7: grasp if ready.
-    if gcur["z"] == "LOW":
-        return _tool("GRASP", {"obj_id": target_id, "grasp_type": "topdown_pincher"})
-
-    # Rule 8: next best suggestion / recovery meta-call.
-    if obs["last_action_outcome"] in {"missed_contact", "grasp_fail"}:
-        # If we already seem aligned but are failing, emit a recovery policy tool call.
-        policy = "retry"
-        if gcur["cell"] != target["cell"]:
-            policy = "reapproach"
-        elif gcur["yaw_bin"] != target["yaw_bin"]:
-            policy = "realign"
-        return _tool("RETRY_OR_ABORT", {"policy": policy, "obj_id": target_id})
-
-    return _interact("coach", "Lower to LOW over the target, then grasp.")
+    # Waiting for a YES/NO; keep prompting.
+    text = f"Do you want me to approach the {intended['label']}?"
+    choices = ["1) YES", "2) NO"]
+    context = {"type": "confirm", "obj_id": intended["id"], "label": intended["label"]}
+    return _interact("CONFIRM", text, choices, context, state)
 
 
 def validate_tool_call(tool_call: Dict) -> None:
-    if not isinstance(tool_call, dict) or set(tool_call.keys()) != {"tool_name", "arguments"}:
-        raise ValueError("Tool call must be {tool_name, arguments}")
-    name = tool_call["tool_name"]
-    args = tool_call["arguments"]
-    if name not in {"INTERACT", "SELECT_TARGET", "APPROACH", "ALIGN_YAW", "GRASP", "RETRY_OR_ABORT"}:
-        raise ValueError(f"Invalid tool_name: {name}")
+    if not isinstance(tool_call, dict) or set(tool_call.keys()) != {"tool", "args"}:
+        raise ValueError("Tool call must be {tool, args}")
+    tool = tool_call["tool"]
+    args = tool_call["args"]
+    if tool not in {"INTERACT", "APPROACH", "ALIGN_YAW"}:
+        raise ValueError(f"Invalid tool: {tool}")
     if not isinstance(args, dict):
-        raise ValueError("arguments must be an object")
-    if name == "INTERACT":
-        if set(args.keys()) not in ({"type", "text"}, {"type", "text", "choices"}):
-            raise ValueError("INTERACT args must be {type,text[,choices]}")
-        if args["type"] not in {"question", "confirm", "coach", "offer_takeover", "notify"}:
-            raise ValueError("Invalid INTERACT.type")
+        raise ValueError("args must be an object")
+    if tool == "INTERACT":
+        required_keys = {"kind", "text", "choices"}
+        if set(args.keys()) != required_keys:
+            raise ValueError("INTERACT args must be {kind,text,choices}")
+        if args["kind"] not in {"QUESTION", "SUGGESTION", "CONFIRM"}:
+            raise ValueError("Invalid INTERACT.kind")
         if not isinstance(args["text"], str):
-            raise ValueError("Invalid INTERACT.text")
-        if "choices" in args:
-            if args["type"] != "question":
-                raise ValueError("choices only allowed for type=question")
-            if not isinstance(args["choices"], list) or not all(isinstance(x, str) for x in args["choices"]):
-                raise ValueError("Invalid INTERACT.choices")
-    elif name == "SELECT_TARGET":
-        if set(args.keys()) != {"obj_id"} or not isinstance(args["obj_id"], str):
-            raise ValueError("SELECT_TARGET args must be {obj_id}")
-    elif name == "APPROACH":
-        if set(args.keys()) != {"obj_id", "mode", "hover"}:
-            raise ValueError("APPROACH args must be {obj_id,mode,hover}")
-        if args["mode"] != "topdown":
-            raise ValueError("APPROACH.mode must be topdown")
-        if args["hover"] not in {"HIGH", "MID"}:
-            raise ValueError("APPROACH.hover must be HIGH|MID")
-    elif name == "ALIGN_YAW":
-        if set(args.keys()) != {"obj_id", "yaw_bin"}:
-            raise ValueError("ALIGN_YAW args must be {obj_id,yaw_bin}")
-        if args["yaw_bin"] not in set(yawlib.YAW_BINS):
-            raise ValueError("Invalid ALIGN_YAW.yaw_bin")
-    elif name == "GRASP":
-        if set(args.keys()) != {"obj_id", "grasp_type"}:
-            raise ValueError("GRASP args must be {obj_id,grasp_type}")
-        if args["grasp_type"] != "topdown_pincher":
-            raise ValueError("Invalid GRASP.grasp_type")
-    elif name == "RETRY_OR_ABORT":
-        if set(args.keys()) != {"policy", "obj_id"}:
-            raise ValueError("RETRY_OR_ABORT args must be {policy,obj_id}")
-        if args["policy"] not in {"retry", "realign", "reapproach", "ask_user", "abort"}:
-            raise ValueError("Invalid RETRY_OR_ABORT.policy")
-
-
+            raise ValueError("INTERACT.text must be a string")
+        choices = args["choices"]
+        if not isinstance(choices, list) or not choices or not all(isinstance(c, str) for c in choices):
+            raise ValueError("INTERACT.choices must be a non-empty list of strings")
+        for c in choices:
+            prefix = c.split(")", 1)[0]
+            if not prefix.isdigit():
+                raise ValueError("INTERACT.choices must start with numbered prefixes like '1)'")
+    elif tool in {"APPROACH", "ALIGN_YAW"}:
+        if set(args.keys()) != {"obj"} or not isinstance(args["obj"], str):
+            raise ValueError(f"{tool} args must be {{obj}}")

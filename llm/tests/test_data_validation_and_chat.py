@@ -18,7 +18,7 @@ def test_validate_and_convert_contract_to_chat(tmp_path: Path):
                         "id": "0",
                         "instruction": "Return a tool call.",
                         "input": "{\"obs\":{}}",
-                        "output": "{\"tool_name\":\"INTERACT\",\"arguments\":{\"type\":\"notify\",\"text\":\"ok\"}}",
+                        "output": "{\"tool\":\"INTERACT\",\"args\":{\"kind\":\"SUGGESTION\",\"text\":\"ok\",\"choices\":[\"1) YES\",\"2) NO\"]}}",
                     }
                 )
             ]
@@ -44,9 +44,22 @@ def test_convert_generator_jsonl_to_contract(tmp_path: Path):
             {
                 "episode_id": 1,
                 "t": 2,
-                "obs": {"objects": [], "gripper_hist": [], "candidates": [], "last_action_outcome": "none"},
-                "dialog": [{"role": "user", "content": "mug"}],
-                "target_tool_call": {"tool_name": "SELECT_TARGET", "arguments": {"obj_id": "o0"}},
+                "objects": [{"id": "o0", "label": "mug", "cell": "A1", "yaw": "N", "is_held": False}],
+                "gripper_hist": [
+                    {"cell": "A1", "yaw": "N", "z": "MID"},
+                    {"cell": "A1", "yaw": "N", "z": "MID"},
+                    {"cell": "A1", "yaw": "N", "z": "MID"},
+                    {"cell": "A1", "yaw": "N", "z": "MID"},
+                    {"cell": "A1", "yaw": "N", "z": "MID"},
+                    {"cell": "A1", "yaw": "N", "z": "MID"},
+                ],
+                "memory": {
+                    "past_dialogs": [{"role": "user", "content": "mug"}],
+                    "candidates": ["o0"],
+                    "n_interactions": 1,
+                    "last_tool_calls": ["INTERACT"],
+                },
+                "target_tool_call": {"tool": "APPROACH", "args": {"obj": "o0"}},
             }
         )
         + "\n",
@@ -55,4 +68,3 @@ def test_convert_generator_jsonl_to_contract(tmp_path: Path):
     out = tmp_path / "contract.jsonl"
     convert_generator_jsonl_to_contract(str(gen), str(out))
     validate_dataset_contract_jsonl(str(out))
-

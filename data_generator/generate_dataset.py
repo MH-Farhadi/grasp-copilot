@@ -4,48 +4,111 @@ import argparse
 import json
 import os
 import random
-from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 from .episode import Episode, OBJECT_LABELS, write_jsonl
 from .oracle import OracleState, oracle_decide_tool, validate_tool_call
 
 
-def _append_user_response_for_ambiguity(
+def _deepcopy_memory(mem: Dict) -> Dict:
+    return {
+        "n_interactions": int(mem["n_interactions"]),
+        "past_dialogs": list(mem["past_dialogs"]),
+        "candidates": list(mem["candidates"]),
+        "last_tool_calls": list(mem["last_tool_calls"]),
+    }
+
+
+def _strip_choice_label(choice: str) -> str:
+    parts = choice.split(")", 1)
+    return parts[1].strip() if len(parts) == 2 else choice.strip()
+
+
+def _simulate_user_response(
     rng: random.Random,
-    dialog: List[Dict],
-    choices: Tuple[str, str],
-    intended_label: str,
+    tool_call: Dict,
+    episode: Episode,
+    memory: Dict,
+    state: OracleState,
 ) -> None:
-    if rng.random() >= 0.6:
+    """
+    Apply the user-simulation rules to update memory and oracle state.
+    """
+    if tool_call["tool"] != "INTERACT":
+        state.last_prompt_context = None
         return
-    a, b = choices
-    if intended_label in choices and rng.random() < 0.7:
-        pick = intended_label
+
+    ctx = state.last_prompt_context or {}
+    # If the oracle is explicitly waiting for a reply, always respond.
+    # Otherwise, allow the simulated user to be occasionally quiet.
+    must_respond = bool(state.awaiting_choice or state.awaiting_confirmation or state.awaiting_help)
+    if (not must_respond) and rng.random() >= 0.6:
+        return
+
+    def append_user(content: str) -> None:
+        memory["past_dialogs"].append({"role": "user", "content": content})
+
+    if ctx.get("type") == "candidate_question":
+        labels = ctx.get("labels", [])
+        intended_label = episode.intended_obj().label
+        declined_label: Optional[str] = None
+        if state.last_declined_obj_id is not None:
+            for o in episode.objects:
+                if o.id == state.last_declined_obj_id:
+                    declined_label = o.label
+                    break
+        if labels and intended_label in labels and rng.random() < 0.7:
+            # If the user just declined this object, they are less likely to pick it again immediately.
+            if declined_label is not None and intended_label == declined_label and len(labels) >= 2 and rng.random() < 0.85:
+                others = [l for l in labels if l != declined_label]
+                pick = rng.choice(others) if others else intended_label
+            else:
+                pick = intended_label
+        else:
+            pick = rng.choice(labels) if labels else _strip_choice_label(rng.choice(tool_call["args"]["choices"]))
+        append_user(pick)
+        for o in episode.objects:
+            if o.label == pick:
+                state.selected_obj_id = o.id
+                break
+        state.awaiting_choice = False
+        state.awaiting_confirmation = False
+    elif ctx.get("type") in {"confirm", "help"}:
+        obj_id = ctx.get("obj_id")
+        aligns = obj_id == episode.intended_obj_id
+        yes_prob = 0.75 if aligns else 0.25
+        resp = "YES" if rng.random() < yes_prob else "NO"
+        append_user(resp)
+        if resp == "YES" and obj_id:
+            state.pending_action_obj_id = obj_id
+            state.selected_obj_id = obj_id
+            state.last_declined_obj_id = None
+        elif resp == "NO" and obj_id:
+            state.last_declined_obj_id = obj_id
+        # Once the user answered, don't keep re-confirming the same selection.
+        # The oracle can rely on pending_action_obj_id (on YES) to proceed.
+        if ctx["type"] in {"confirm", "help"}:
+            state.selected_obj_id = None
+        if ctx["type"] == "confirm":
+            state.awaiting_confirmation = False
+        if ctx["type"] == "help":
+            state.awaiting_help = False
     else:
-        pick = rng.choice([a, b])
-    dialog.append({"role": "user", "content": pick})
+        # Fallback: respect yes/no prompts with semantic logging.
+        labels = [c for c in tool_call["args"].get("choices", [])]
+        yes_prob = 0.5
+        resp = "YES" if rng.random() < yes_prob else "NO"
+        if any("YES" in l.upper() for l in labels):
+            append_user(resp)
 
-
-def _append_user_response_for_takeover(rng: random.Random, dialog: List[Dict]) -> bool:
-    """
-    Returns True if user says "no, just guide", else False.
-    """
-    if rng.random() < 0.5:
-        dialog.append({"role": "user", "content": "yes please"})
-        return False
-    dialog.append({"role": "user", "content": "no, just guide"})
-    return True
+    state.last_prompt_context = None
 
 
 def _schema_validate_record(rec: Dict) -> None:
-    for k in ("episode_id", "t", "obs", "dialog", "target_tool_call"):
+    for k in ("episode_id", "t", "objects", "gripper_hist", "memory", "target_tool_call"):
         if k not in rec:
             raise ValueError(f"Missing key: {k}")
-    obs = rec["obs"]
-    if set(obs.keys()) != {"objects", "gripper_hist", "candidates", "last_action_outcome"}:
-        raise ValueError("obs keys mismatch")
-    if len(obs["gripper_hist"]) != 6:
+    if len(rec["gripper_hist"]) != 6:
         raise ValueError("gripper_hist must have length 6")
     validate_tool_call(rec["target_tool_call"])
 
@@ -53,91 +116,63 @@ def _schema_validate_record(rec: Dict) -> None:
 def generate(episodes: int, seed: int) -> Tuple[List[Dict], Dict]:
     rng = random.Random(seed)
     records: List[Dict] = []
-
-    tool_counts: Counter = Counter()
-    total_steps = 0
-    ambiguity_steps = 0
-    grasp_attempts = 0
-    grasp_successes = 0
-    just_guide_episodes = 0
+    tool_counts: Dict[str, int] = {"INTERACT": 0, "APPROACH": 0, "ALIGN_YAW": 0}
 
     for episode_id in range(episodes):
-        n_obj = rng.randint(2, len(OBJECT_LABELS))
+        n_obj = rng.randint(2, min(10, len(OBJECT_LABELS)))
         ep = Episode(rng=rng, episode_id=episode_id, n_obj=n_obj)
-        intended_label = ep.intended_obj().label
-
-        dialog: List[Dict] = []
-        state = OracleState()
-        last_tool_name: Optional[str] = None
-        episode_just_guide = False
+        state = OracleState(intended_obj_id=ep.intended_obj_id)
+        memory: Dict = {
+            "n_interactions": 0,
+            "past_dialogs": [],
+            "candidates": ep.gripper_candidates(max_dist=1),
+            "last_tool_calls": [],
+        }
 
         for t in range(ep.T):
-            # Simulated user replies arrive one step after the assistant prompt.
-            if state.pending_user_prompt == "ambiguity" and state.pending_ambiguity_choices is not None:
-                _append_user_response_for_ambiguity(rng, dialog, state.pending_ambiguity_choices, intended_label)
-                state.pending_user_prompt = None
-                state.pending_ambiguity_choices = None
-            elif state.pending_user_prompt == "takeover":
-                said_no = _append_user_response_for_takeover(rng, dialog)
-                state.pending_user_prompt = None
-                state.pending_takeover_obj_id = None
-                if said_no:
-                    state.just_guide = True
-                    episode_just_guide = True
-
-            # User teleop steps happen when the assistant isn't directly controlling motion.
-            if last_tool_name in (None, "INTERACT", "SELECT_TARGET", "RETRY_OR_ABORT"):
-                ep.apply_user_teleop_step()
-
-            obs = ep.observe()
-            tool_call = oracle_decide_tool(obs=obs, dialog=dialog, state=state)
-            validate_tool_call(tool_call)
-
-            rec = {
+            # Snapshot before choosing the tool call.
+            memory["candidates"] = ep.gripper_candidates(max_dist=1)
+            record = {
                 "episode_id": episode_id,
                 "t": t,
-                "obs": obs,
-                "dialog": list(dialog),
-                "target_tool_call": tool_call,
+                "objects": [o.to_record() for o in ep.objects],
+                "gripper_hist": [p.to_record() for p in ep.gripper_hist],
+                "memory": _deepcopy_memory(memory),
             }
-            _schema_validate_record(rec)
-            records.append(rec)
 
-            tool_counts[tool_call["tool_name"]] += 1
-            total_steps += 1
-            if tool_call["tool_name"] == "INTERACT" and tool_call["arguments"]["type"] == "question":
-                ambiguity_steps += 1
-                state.pending_user_prompt = "ambiguity"
-                choices = tool_call["arguments"].get("choices", [])
-                if isinstance(choices, list) and len(choices) == 2:
-                    state.pending_ambiguity_choices = (choices[0], choices[1])
-            if tool_call["tool_name"] == "INTERACT" and tool_call["arguments"]["type"] == "offer_takeover":
-                state.pending_user_prompt = "takeover"
+            tool_call = oracle_decide_tool(record["objects"], record["gripper_hist"], memory, state)
+            validate_tool_call(tool_call)
+            record["target_tool_call"] = tool_call
+            _schema_validate_record(record)
+            records.append(record)
 
-            if tool_call["tool_name"] == "GRASP":
-                grasp_attempts += 1
+            tool_counts[tool_call["tool"]] += 1
 
-            outcome = ep.step_tool(tool_call)
-            state.outcomes.append(outcome)
-            last_tool_name = tool_call["tool_name"]
+            # Update dialog and interaction counters.
+            if tool_call["tool"] == "INTERACT":
+                memory["n_interactions"] += 1
+                memory["past_dialogs"].append({"role": "assistant", "content": tool_call["args"]["text"]})
 
-            if outcome == "grasp_success":
-                grasp_successes += 1
+            _simulate_user_response(rng, tool_call, ep, memory, state)
 
-            # Update dialog after the assistant action for next timestep context.
-            if tool_call["tool_name"] == "INTERACT":
-                dialog.append({"role": "assistant", "content": tool_call["arguments"]["text"]})
+            # Maintain a short history of tool calls for memory logging.
+            memory["last_tool_calls"].append(tool_call["tool"])
+            memory["last_tool_calls"] = memory["last_tool_calls"][-3:]
 
-        if episode_just_guide:
-            just_guide_episodes += 1
+            # Apply tool effects then simulate teleop toward intent.
+            ep.apply_tool(tool_call)
+            if t < ep.T - 1:
+                # If the assistant executed a non-interactive tool, the human is less likely
+                # to keep fighting the motion on the very next step. This reduces unrealistic
+                # "ALIGN_YAW spam" / oscillatory behavior.
+                if tool_call["tool"] != "INTERACT" and rng.random() < 0.85:
+                    continue
+                ep.apply_user_motion()
 
-    stats = {
-        "tool_distribution": dict(tool_counts),
-        "avg_episode_length": (total_steps / episodes) if episodes else 0.0,
-        "ambiguity_rate": (ambiguity_steps / total_steps) if total_steps else 0.0,
-        "grasp_success_rate": (grasp_successes / grasp_attempts) if grasp_attempts else 0.0,
-        "fraction_just_guide_episodes": (just_guide_episodes / episodes) if episodes else 0.0,
-    }
+        # Reset per-episode flags that should not leak; none currently.
+        state.last_tool_calls.clear()
+
+    stats = {"tool_distribution": tool_counts}
     return records, stats
 
 
@@ -157,5 +192,4 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
 

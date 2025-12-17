@@ -108,23 +108,22 @@ def convert_generator_jsonl_to_contract(
     Thin adapter to reuse the existing generator output.
 
     Expected generator record keys:
-      - episode_id, t, obs, dialog, target_tool_call
+      - episode_id, t, objects, gripper_hist, memory, target_tool_call
     Produces dataset-contract JSONL with output as a JSON string.
     """
     if instruction is None:
         instruction = (
             "Given the robot observation and dialog context, infer the user's intent and "
-            "route to exactly one tool call. Output ONLY the tool call JSON with keys "
-            "tool_name and arguments."
+            "emit exactly one tool call. Output ONLY the tool call JSON with keys tool and args."
         )
 
     rows: List[Dict] = []
     for line_no, obj in iter_jsonl(generator_path):
-        for k in ("episode_id", "t", "obs", "dialog", "target_tool_call"):
+        for k in ("episode_id", "t", "objects", "gripper_hist", "memory", "target_tool_call"):
             if k not in obj:
                 _fail(generator_path, line_no, f"Missing key: {k}")
         ex_id = f"{obj['episode_id']}_{obj['t']}"
-        input_blob = {"obs": obj["obs"], "dialog": obj["dialog"]}
+        input_blob = {"objects": obj["objects"], "gripper_hist": obj["gripper_hist"], "memory": obj["memory"]}
         output_obj = obj["target_tool_call"]
         if not isinstance(output_obj, dict):
             _fail(generator_path, line_no, "target_tool_call must be an object")
@@ -147,4 +146,3 @@ def convert_contract_to_qwen_chat_jsonl(contract_path: str, out_path: str) -> No
     examples = load_dataset_contract(contract_path)
     rows = [dataset_contract_to_qwen_chat_messages(ex) for ex in examples]
     write_jsonl(out_path, rows)
-

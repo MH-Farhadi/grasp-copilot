@@ -1,0 +1,29 @@
+# grasp-copilot requirements (for use inside a conda env via pip)
+#
+# Suggested workflow:
+#   conda activate <your_env>
+#   python -m pip install -r grasp-copilot/requirements.txt
+#
+# Notes:
+# - Install PyTorch in the way that matches your CUDA setup (conda is often easiest).
+# - If you train with `--use_4bit`, you'll also need bitsandbytes (see optional section).
+
+# Core
+numpy>=1.23
+
+# LLM (training + inference)
+torch>=2.1
+transformers>=4.40
+datasets>=2.16
+accelerate>=0.28
+peft>=0.10
+trl>=0.9
+
+# Tests (optional but recommended)
+pytest>=7.4
+
+# Optional (only if you need them; uncomment)
+# bitsandbytes>=0.43; platform_system=="Linux"    # for --use_4bit (QLoRA)
+# tiktoken>=0.6                                   # some models/tokenizers may require this
+# sentencepiece>=0.1.99                           # some tokenizers may require this
+
