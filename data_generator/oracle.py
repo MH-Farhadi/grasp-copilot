@@ -67,6 +67,26 @@ def _has_yaw_oscillation(gripper_hist: Sequence[Dict]) -> Tuple[bool, Optional[s
     return True, dominant_cell, yaw1, yaw2
 
 
+def _has_cell_oscillation(gripper_hist: Sequence[Dict], cell_a: str, cell_b: str) -> bool:
+    """
+    Detects whether the gripper has been oscillating between two cells recently.
+    This supports ambiguity prompts even when last_tool_calls is empty.
+    """
+    if len(gripper_hist) < 6:
+        return False
+    cells = [g["cell"] for g in gripper_hist]
+    allowed = {cell_a, cell_b}
+    # Require both cells to appear at least twice.
+    if cells.count(cell_a) < 2 or cells.count(cell_b) < 2:
+        return False
+    # Require multiple transitions between the two cells.
+    transitions = 0
+    for i in range(1, len(cells)):
+        if cells[i] != cells[i - 1] and {cells[i], cells[i - 1]} <= allowed:
+            transitions += 1
+    return transitions >= 2
+
+
 def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], memory: Dict, state: OracleState) -> Dict:
     current_cell = gripper_hist[-1]["cell"]
     candidates = list(memory.get("candidates", []))
@@ -131,27 +151,50 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
     if state.selected_obj_id is not None and not state.awaiting_confirmation:
         obj = objects_by_id.get(state.selected_obj_id)
         if obj:
-            state.awaiting_confirmation = True
-            question = f"Do you want me to approach the {obj['label']}?"
-            choices = ["1) YES", "2) NO"]
-            context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"]}
-            return _interact("CONFIRM", question, choices, context, state)
+            # Ask to confirm the *next* action we would take (approach vs align yaw),
+            # so the post-confirm tool call matches the user's expectation.
+            if current_cell != obj["cell"]:
+                question = f"Do you want me to approach the {obj['label']}?"
+                context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"], "action": "APPROACH"}
+            elif current_yaw != obj["yaw"]:
+                question = f"Do you want me to align yaw to the {obj['label']}?"
+                context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"], "action": "ALIGN_YAW"}
+            else:
+                # Already at the desired pose; no need to confirm another action.
+                state.selected_obj_id = None
+                state.awaiting_confirmation = False
+                state.awaiting_choice = False
+                state.awaiting_help = False
+                obj = None
+            if obj is not None:
+                state.awaiting_confirmation = True
+                choices = ["1) YES", "2) NO"]
+                return _interact("CONFIRM", question, choices, context, state)
 
     # Candidate clarification when approach evidence is similar.
+    #
+    # Important: don't ask this every timestep. Gate it so it primarily triggers right after
+    # a movement step (APPROACH), which makes it feel like the assistant is reacting to
+    # ambiguous motion rather than nagging.
     top_two = _top_two_candidates(objects, candidates, current_cell)
+    last_calls = list(memory.get("last_tool_calls", []))
+    just_moved = bool(last_calls and last_calls[-1] == "APPROACH")
     if top_two and not state.awaiting_choice and not state.awaiting_confirmation:
         a, b = top_two
-        dist_a = grid.manhattan(current_cell, a["cell"])
-        dist_b = grid.manhattan(current_cell, b["cell"])
-        if abs(dist_a - dist_b) <= 1:
-            text = (
-                f"I notice you are approaching the {a['label']}. "
-                f"However, {b['label']} is also close. Which one do you want to grasp?"
-            )
-            choices = [f"1) {a['label']}", f"2) {b['label']}"]
-            context = {"type": "candidate_question", "labels": [a["label"], b["label"]]}
-            state.awaiting_choice = True
-            return _interact("QUESTION", text, choices, context, state)
+        osc = _has_cell_oscillation(gripper_hist, a["cell"], b["cell"])
+        allow = just_moved or osc
+        if allow:
+            dist_a = grid.manhattan(current_cell, a["cell"])
+            dist_b = grid.manhattan(current_cell, b["cell"])
+            if abs(dist_a - dist_b) <= 1:
+                text = (
+                    f"I notice you are approaching the {a['label']}. "
+                    f"However, {b['label']} is also close. Which one do you want to grasp?"
+                )
+                choices = [f"1) {a['label']}", f"2) {b['label']}"]
+                context = {"type": "candidate_question", "labels": [a["label"], b["label"]]}
+                state.awaiting_choice = True
+                return _interact("QUESTION", text, choices, context, state)
 
     # Yaw struggle suggestion.
     triggered, dom_cell, yaw1, yaw2 = _has_yaw_oscillation(gripper_hist)

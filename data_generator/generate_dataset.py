@@ -70,6 +70,9 @@ def _simulate_user_response(
         for o in episode.objects:
             if o.label == pick:
                 state.selected_obj_id = o.id
+                # Treat the user's selection as the new "intended" goal to avoid
+                # oscillating back to the original hidden intent.
+                state.intended_obj_id = o.id
                 break
         state.awaiting_choice = False
         state.awaiting_confirmation = False
@@ -82,6 +85,8 @@ def _simulate_user_response(
         if resp == "YES" and obj_id:
             state.pending_action_obj_id = obj_id
             state.selected_obj_id = obj_id
+            # If the user confirmed, lock the goal to that object.
+            state.intended_obj_id = obj_id
             state.last_declined_obj_id = None
         elif resp == "NO" and obj_id:
             state.last_declined_obj_id = obj_id
@@ -165,9 +170,17 @@ def generate(episodes: int, seed: int) -> Tuple[List[Dict], Dict]:
                 # If the assistant executed a non-interactive tool, the human is less likely
                 # to keep fighting the motion on the very next step. This reduces unrealistic
                 # "ALIGN_YAW spam" / oscillatory behavior.
-                if tool_call["tool"] != "INTERACT" and rng.random() < 0.85:
-                    continue
-                ep.apply_user_motion()
+                skip_user_motion = tool_call["tool"] != "INTERACT" and rng.random() < 0.85
+                if not skip_user_motion:
+                    ep.apply_user_motion()
+
+            # If we've reached the currently intended object pose (cell + yaw),
+            # stop the episode early. This makes APPROACH/ALIGN_YAW naturally "final"
+            # actions and avoids long post-goal chat loops.
+            intended = ep.get_obj(state.intended_obj_id)
+            g = ep.gripper_hist[-1]
+            if g.cell == intended.cell and g.yaw == intended.yaw:
+                break
 
         # Reset per-episode flags that should not leak; none currently.
         state.last_tool_calls.clear()
