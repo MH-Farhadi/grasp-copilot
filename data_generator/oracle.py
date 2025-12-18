@@ -13,13 +13,18 @@ class OracleState:
     intended_obj_id: str
     selected_obj_id: Optional[str] = None
     pending_action_obj_id: Optional[str] = None
+    pending_mode: Optional[str] = None  # "APPROACH" | "ALIGN_YAW"
     awaiting_confirmation: bool = False
     awaiting_help: bool = False
     awaiting_choice: bool = False
+    awaiting_intent_gate: bool = False
+    awaiting_anything_else: bool = False
+    awaiting_mode_select: bool = False
     last_prompt_context: Optional[Dict] = None
     # Track recent user rejections to avoid asking the exact same question in a loop.
     last_declined_obj_id: Optional[str] = None
     last_tool_calls: List[str] = field(default_factory=list)
+    terminate_episode: bool = False
 
 
 def _tool(tool: str, args: Dict) -> Dict:
@@ -31,13 +36,18 @@ def _interact(kind: str, text: str, choices: List[str], context: Dict, state: Or
     return _tool("INTERACT", {"kind": kind, "text": text, "choices": choices})
 
 
-def _top_two_candidates(objects: Sequence[Dict], candidates: Sequence[str], gripper_cell: str) -> Optional[List[Dict]]:
+def _rank_candidates(objects: Sequence[Dict], candidates: Sequence[str], gripper_cell: str) -> List[Dict]:
     available = [o for o in objects if o["id"] in set(candidates) and not o["is_held"]]
-    if len(available) < 2:
-        return None
     scored = [(o, grid.manhattan(gripper_cell, o["cell"])) for o in available]
     scored.sort(key=lambda x: (x[1], x[0]["id"]))
-    return [scored[0][0], scored[1][0]]
+    return [o for o, _ in scored]
+
+
+def _top_two_candidates(objects: Sequence[Dict], candidates: Sequence[str], gripper_cell: str) -> Optional[List[Dict]]:
+    ranked = _rank_candidates(objects, candidates, gripper_cell)
+    if len(ranked) < 2:
+        return None
+    return [ranked[0], ranked[1]]
 
 
 def _has_yaw_oscillation(gripper_hist: Sequence[Dict]) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
@@ -87,15 +97,71 @@ def _has_cell_oscillation(gripper_hist: Sequence[Dict], cell_a: str, cell_b: str
     return transitions >= 2
 
 
+def _emit_intent_gate(objects: Sequence[Dict], gripper_hist: Sequence[Dict], memory: Dict, state: OracleState) -> Optional[Dict]:
+    """
+    Returns an INTERACT tool call if we can ask a high-signal intent-gating question,
+    otherwise returns None.
+    """
+    current_cell = gripper_hist[-1]["cell"]
+    candidates = list(memory.get("candidates", []))
+
+    # Prefer candidate-based intent gating.
+    ranked = _rank_candidates(objects, candidates, current_cell)
+    if len(ranked) >= 2:
+        k = min(3, len(ranked))
+        a = ranked[0]
+        others = ranked[1:k]
+        other_labels = ", ".join(o["label"] for o in others)
+        text = (
+            f"I notice you are approaching the {a['label']}. However, {other_labels} "
+            f"{'is' if len(others)==1 else 'are'} also close. Are you trying to grasp one of these?"
+        )
+        choices = ["1) YES", "2) NO"]
+        context = {"type": "intent_gate_candidates", "labels": [o["label"] for o in ranked[:k]]}
+        return _interact("QUESTION", text, choices, context, state)
+
+    # Otherwise, gate on yaw struggle if present.
+    triggered, dom_cell, yaw1, yaw2 = _has_yaw_oscillation(gripper_hist)
+    if triggered:
+        target_obj = next((o for o in objects if o["cell"] == dom_cell), None)
+        if target_obj:
+            text = (
+                f"I notice you are struggling aligning the gripper yaw while near the {target_obj['label']}. "
+                f"Is that what you are trying to do?"
+            )
+            choices = ["1) YES", "2) NO"]
+            context = {"type": "intent_gate_yaw", "obj_id": target_obj["id"], "label": target_obj["label"]}
+            return _interact("QUESTION", text, choices, context, state)
+
+    return None
+
+
 def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], memory: Dict, state: OracleState) -> Dict:
     current_cell = gripper_hist[-1]["cell"]
     candidates = list(memory.get("candidates", []))
     objects_by_id = {o["id"]: o for o in objects}
     current_yaw = gripper_hist[-1]["yaw"]
 
+    if state.terminate_episode:
+        # The driver should stop the episode when this is set. Fall back to a single
+        # benign prompt to avoid motion tools if called anyway.
+        return _interact(
+            "SUGGESTION",
+            "Okay. I'll stay out of the way.",
+            ["1) OK"],
+            {"type": "terminal_ack"},
+            state,
+        )
+
     # Follow-up action after user confirmed help/approach.
     if state.pending_action_obj_id is not None and state.pending_action_obj_id in objects_by_id:
         target = objects_by_id[state.pending_action_obj_id]
+        # Respect the user's selected mode (if any). If mode doesn't apply, fall back
+        # to whichever correction is needed.
+        if state.pending_mode == "APPROACH" and current_cell != target["cell"]:
+            return _tool("APPROACH", {"obj": target["id"]})
+        if state.pending_mode == "ALIGN_YAW" and current_yaw != target["yaw"]:
+            return _tool("ALIGN_YAW", {"obj": target["id"]})
         if current_cell != target["cell"]:
             return _tool("APPROACH", {"obj": target["id"]})
         if current_yaw != target["yaw"]:
@@ -103,32 +169,51 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
         # Completed the pending action; clear selection to avoid re-confirm loops.
         state.pending_action_obj_id = None
         state.selected_obj_id = None
+        state.pending_mode = None
         state.awaiting_confirmation = False
         state.awaiting_choice = False
         state.awaiting_help = False
+        state.awaiting_intent_gate = False
+        state.awaiting_anything_else = False
+        state.awaiting_mode_select = False
 
     # If we're waiting for a user reply, keep prompting (don't fall through to motion tools).
     if state.awaiting_confirmation:
         obj_id = state.selected_obj_id or state.intended_obj_id
         obj = objects_by_id.get(obj_id)
         if obj:
-            question = f"Do you want me to approach the {obj['label']}?"
+            action = state.last_prompt_context.get("action") if state.last_prompt_context else None
+            if action == "ALIGN_YAW":
+                question = f"Do you want me to align yaw to the {obj['label']}?"
+            else:
+                question = f"Do you want me to approach the {obj['label']}?"
             choices = ["1) YES", "2) NO"]
-            context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"]}
+            context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"], "action": action or "APPROACH"}
             return _interact("CONFIRM", question, choices, context, state)
         state.awaiting_confirmation = False
 
+    if state.awaiting_anything_else:
+        text = "Uh, I should have misunderstood. Is there anything else I can help with?"
+        choices = ["1) YES", "2) NO"]
+        context = {"type": "anything_else"}
+        return _interact("QUESTION", text, choices, context, state)
+
+    if state.awaiting_mode_select:
+        text = (
+            "Do you want help with approaching an object or aligning the gripper yaw to an object?"
+        )
+        choices = ["1) APPROACH", "2) ALIGN_YAW"]
+        context = {"type": "mode_select"}
+        return _interact("SUGGESTION", text, choices, context, state)
+
     if state.awaiting_choice:
-        top_two = _top_two_candidates(objects, candidates, current_cell)
-        if top_two:
-            a, b = top_two
-            text = (
-                f"I notice you are approaching the {a['label']}. "
-                f"However, {b['label']} is also close. Which one do you want to grasp?"
-            )
-            choices = [f"1) {a['label']}", f"2) {b['label']}"]
-            context = {"type": "candidate_question", "labels": [a["label"], b["label"]]}
-            return _interact("QUESTION", text, choices, context, state)
+        ranked = _rank_candidates(objects, candidates, current_cell)
+        if ranked:
+            k = min(4, len(ranked))
+            labels = [ranked[i]["label"] for i in range(k)]
+            choices = [f"{i+1}) {labels[i]}" for i in range(k)]
+            context = {"type": "candidate_choice", "labels": labels}
+            return _interact("QUESTION", "Uh, which one do you want?", choices, context, state)
         state.awaiting_choice = False
 
     if state.awaiting_help:
@@ -137,15 +222,27 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
         if triggered:
             target_obj = next((o for o in objects if o["cell"] == dom_cell), None)
             if target_obj and target_obj["yaw"] not in {yaw1, yaw2}:
-                text = (
-                    f"It looks like you are trying to align to the {target_obj['label']} at {dom_cell}, "
-                    f"but the gripper yaw keeps changing ({yaw1} and {yaw2}) instead of matching the object yaw "
-                    f"({target_obj['yaw']}). Do you want me to help?"
-                )
+                text = f"Do you want me to help you align yaw to the {target_obj['label']}?"
                 choices = ["1) YES", "2) NO"]
                 context = {"type": "help", "obj_id": target_obj["id"], "yaws": (yaw1, yaw2, target_obj["yaw"])}
                 return _interact("SUGGESTION", text, choices, context, state)
         state.awaiting_help = False
+
+    if state.awaiting_intent_gate:
+        gate = _emit_intent_gate(objects, gripper_hist, memory, state)
+        if gate is not None:
+            return gate
+        state.awaiting_intent_gate = False
+
+    # At the very beginning of an episode, force an intent-gating INTERACT before any action.
+    # This matches the desired behavior: clarify intent first, then approach/align.
+    if int(memory.get("n_interactions", 0)) == 0 and not (memory.get("past_dialogs") or []):
+        if not (state.awaiting_confirmation or state.awaiting_choice or state.awaiting_help):
+            state.awaiting_intent_gate = True
+            gate = _emit_intent_gate(objects, gripper_hist, memory, state)
+            if gate is not None:
+                return gate
+            state.awaiting_intent_gate = False
 
     # Confirmation after a user-picked object.
     if state.selected_obj_id is not None and not state.awaiting_confirmation:
@@ -153,7 +250,13 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
         if obj:
             # Ask to confirm the *next* action we would take (approach vs align yaw),
             # so the post-confirm tool call matches the user's expectation.
-            if current_cell != obj["cell"]:
+            if state.pending_mode == "ALIGN_YAW":
+                question = f"Do you want me to align yaw to the {obj['label']}?"
+                context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"], "action": "ALIGN_YAW"}
+            elif state.pending_mode == "APPROACH":
+                question = f"Do you want me to approach the {obj['label']}?"
+                context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"], "action": "APPROACH"}
+            elif current_cell != obj["cell"]:
                 question = f"Do you want me to approach the {obj['label']}?"
                 context = {"type": "confirm", "obj_id": obj["id"], "label": obj["label"], "action": "APPROACH"}
             elif current_yaw != obj["yaw"]:
@@ -165,6 +268,9 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
                 state.awaiting_confirmation = False
                 state.awaiting_choice = False
                 state.awaiting_help = False
+                state.awaiting_intent_gate = False
+                state.awaiting_anything_else = False
+                state.awaiting_mode_select = False
                 obj = None
             if obj is not None:
                 state.awaiting_confirmation = True
@@ -187,13 +293,19 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
             dist_a = grid.manhattan(current_cell, a["cell"])
             dist_b = grid.manhattan(current_cell, b["cell"])
             if abs(dist_a - dist_b) <= 1:
+                # First gate on intent, then ask which specific object.
+                state.awaiting_intent_gate = True
+                ranked = _rank_candidates(objects, candidates, current_cell)
+                k = min(3, len(ranked))
+                a0 = ranked[0]
+                others = ranked[1:k]
+                other_labels = ", ".join(o["label"] for o in others)
                 text = (
-                    f"I notice you are approaching the {a['label']}. "
-                    f"However, {b['label']} is also close. Which one do you want to grasp?"
+                    f"I notice you are approaching the {a0['label']}. However, {other_labels} "
+                    f"{'is' if len(others)==1 else 'are'} also close. Are you trying to grasp one of these?"
                 )
-                choices = [f"1) {a['label']}", f"2) {b['label']}"]
-                context = {"type": "candidate_question", "labels": [a["label"], b["label"]]}
-                state.awaiting_choice = True
+                choices = ["1) YES", "2) NO"]
+                context = {"type": "intent_gate_candidates", "labels": [o["label"] for o in ranked[:k]]}
                 return _interact("QUESTION", text, choices, context, state)
 
     # Yaw struggle suggestion.
@@ -201,15 +313,15 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
     if triggered and not state.awaiting_help:
         target_obj = next((o for o in objects if o["cell"] == dom_cell), None)
         if target_obj and target_obj["yaw"] not in {yaw1, yaw2}:
+            # First gate on intent: is the user trying to align yaw to this object?
+            state.awaiting_intent_gate = True
             text = (
-                f"It looks like you are trying to align to the {target_obj['label']} at {dom_cell}, "
-                f"but the gripper yaw keeps changing ({yaw1} and {yaw2}) instead of matching the object yaw "
-                f"({target_obj['yaw']}). Do you want me to help?"
+                f"I notice you are struggling aligning the gripper yaw while near the {target_obj['label']}. "
+                f"Is that what you are trying to do?"
             )
             choices = ["1) YES", "2) NO"]
-            context = {"type": "help", "obj_id": target_obj["id"], "yaws": (yaw1, yaw2, target_obj["yaw"])}
-            state.awaiting_help = True
-            return _interact("SUGGESTION", text, choices, context, state)
+            context = {"type": "intent_gate_yaw", "obj_id": target_obj["id"], "label": target_obj["label"]}
+            return _interact("QUESTION", text, choices, context, state)
 
     # Default policy: move toward the intended object or align yaw when co-located.
     intended = objects_by_id[state.intended_obj_id]
@@ -223,13 +335,13 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
         state.awaiting_confirmation = True
         text = f"Do you want me to approach the {intended['label']}?"
         choices = ["1) YES", "2) NO"]
-        context = {"type": "confirm", "obj_id": intended["id"], "label": intended["label"]}
+        context = {"type": "confirm", "obj_id": intended["id"], "label": intended["label"], "action": "APPROACH"}
         return _interact("CONFIRM", text, choices, context, state)
 
     # Waiting for a YES/NO; keep prompting.
     text = f"Do you want me to approach the {intended['label']}?"
     choices = ["1) YES", "2) NO"]
-    context = {"type": "confirm", "obj_id": intended["id"], "label": intended["label"]}
+    context = {"type": "confirm", "obj_id": intended["id"], "label": intended["label"], "action": "APPROACH"}
     return _interact("CONFIRM", text, choices, context, state)
 
 

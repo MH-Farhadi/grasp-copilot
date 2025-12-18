@@ -15,5 +15,6 @@ def test_oracle_struggle_triggers_suggestion_on_oscillation():
     state = OracleState(intended_obj_id="o0")
     tool = oracle_decide_tool(objects, gripper_hist, memory, state)
     assert tool["tool"] == "INTERACT"
-    assert tool["args"]["kind"] == "SUGGESTION"
-    assert "Do you want me to help" in tool["args"]["text"]
+    # New flow gates on intent first, then offers help.
+    assert tool["args"]["kind"] == "QUESTION"
+    assert "struggling aligning" in tool["args"]["text"]

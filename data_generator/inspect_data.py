@@ -198,15 +198,82 @@ def _print_episode(
 
 def _summary(rows: Sequence[Dict[str, Any]]) -> None:
     tool_counts = Counter(r.get("target_tool_call", {}).get("tool") for r in rows)
+    interact_kind_counts = Counter(
+        (r.get("target_tool_call", {}).get("args", {}) or {}).get("kind")
+        for r in rows
+        if (r.get("target_tool_call", {}) or {}).get("tool") == "INTERACT"
+    )
     episodes = _episode_groups(rows)
     inter_counts = {ep: int((eps[0].get("memory") or {}).get("n_interactions", 0)) for ep, eps in episodes.items() if eps}
 
     print(f"rows={len(rows)} episodes={len(episodes)}")
     print("tool_distribution:", dict(tool_counts))
+    if interact_kind_counts:
+        # Filter None for cleaner output.
+        interact_kind_counts.pop(None, None)
+        print("interact_kind_distribution:", dict(interact_kind_counts))
 
     if episodes:
         lens = [len(v) for v in episodes.values()]
         print(f"episode_len: min={min(lens)} max={max(lens)} avg={sum(lens)/len(lens):.2f}")
+
+        # Object label coverage + overlap stats (computed per-episode from the first row).
+        label_counts: Counter[str] = Counter()
+        episodes_with_overlap = 0
+        max_overlap_per_ep: List[int] = []
+        for ep_rows in episodes.values():
+            if not ep_rows:
+                continue
+            objs = ep_rows[0].get("objects") or []
+            for o in objs:
+                label_counts[str(o.get("label"))] += 1
+            cell_counts = Counter(str(o.get("cell")) for o in objs)
+            max_mult = max(cell_counts.values()) if cell_counts else 1
+            max_overlap_per_ep.append(max_mult)
+            if any(v >= 2 for v in cell_counts.values()):
+                episodes_with_overlap += 1
+
+        if label_counts:
+            uniq = len(label_counts)
+            most_common = label_counts.most_common(10)
+            print(f"object_label_coverage: unique={uniq} (showing top10 by episode-count)")
+            print("object_label_counts:", dict(most_common))
+
+        if max_overlap_per_ep:
+            overlap_rate = episodes_with_overlap / max(1, len(episodes))
+            print(
+                "object_cell_overlap:",
+                f"episodes_with_overlap={episodes_with_overlap}/{len(episodes)} ({overlap_rate:.2%}),",
+                f"max_objects_sharing_cell: min={min(max_overlap_per_ep)} max={max(max_overlap_per_ep)} avg={sum(max_overlap_per_ep)/len(max_overlap_per_ep):.2f}",
+            )
+
+        # Gripper symbol coverage (cells/yaws/z over all 6-history entries).
+        gripper_cells: Counter[str] = Counter()
+        gripper_yaws: Counter[str] = Counter()
+        gripper_z: Counter[str] = Counter()
+        cand_sizes: Counter[int] = Counter()
+        for r in rows:
+            gh = r.get("gripper_hist") or []
+            for g in gh:
+                if "cell" in g:
+                    gripper_cells[str(g.get("cell"))] += 1
+                if "yaw" in g:
+                    gripper_yaws[str(g.get("yaw"))] += 1
+                if "z" in g:
+                    gripper_z[str(g.get("z"))] += 1
+            mem = r.get("memory") or {}
+            cands = mem.get("candidates") or []
+            if isinstance(cands, list):
+                cand_sizes[len(cands)] += 1
+
+        if gripper_cells:
+            print(f"gripper_cells: unique={len(gripper_cells)} top5={dict(gripper_cells.most_common(5))}")
+        if gripper_yaws:
+            print(f"gripper_yaws: unique={len(gripper_yaws)} top5={dict(gripper_yaws.most_common(5))}")
+        if gripper_z:
+            print(f"gripper_z: unique={len(gripper_z)} counts={dict(gripper_z)}")
+        if cand_sizes:
+            print(f"candidate_set_size: unique={len(cand_sizes)} top5={dict(cand_sizes.most_common(5))}")
 
         rep = {ep: _analyze_repeats(eps) for ep, eps in episodes.items()}
         worst_prompt = max(rep.items(), key=lambda kv: kv[1].max_same_prompt_run)
@@ -228,6 +295,20 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="Inspect and summarize data_generator JSONL datasets.")
     ap.add_argument("--path", type=str, required=True, help="Path to a .jsonl file.")
     ap.add_argument("--episode", type=int, action="append", default=None, help="Episode id(s) to print.")
+    ap.add_argument(
+        "--episode-range",
+        nargs=2,
+        type=int,
+        metavar=("START", "END"),
+        default=None,
+        help="Inclusive episode id range to print (e.g. --episode-range 4 12).",
+    )
+    ap.add_argument(
+        "--episode-step",
+        type=int,
+        default=1,
+        help="Step for --episode-range (default: 1).",
+    )
     ap.add_argument("--max-t", type=int, default=None, help="Max timestep to print per episode.")
     ap.add_argument("--summary", action="store_true", help="Print dataset summary.")
     ap.add_argument("--show-objects", action="store_true", help="Print objects each step.")
@@ -248,6 +329,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     ep_ids: List[int]
     if args.episode:
         ep_ids = list(args.episode)
+    elif args.episode_range:
+        start, end = args.episode_range
+        step = int(args.episode_step)
+        if step <= 0:
+            raise ValueError("--episode-step must be >= 1")
+        if start > end:
+            start, end = end, start
+        ep_ids = list(range(start, end + 1, step))
     else:
         ep_ids = sorted(episodes.keys())[:3]
 

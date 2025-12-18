@@ -20,6 +20,7 @@ def test_oracle_ambiguity_triggers_interact_question():
     tool = oracle_decide_tool(objects, gripper_hist, memory, state)
     assert tool["tool"] == "INTERACT"
     assert tool["args"]["kind"] == "QUESTION"
+    # New flow: first gate on intent with YES/NO, then ask the user to pick a specific object.
     labels = {c.split(")", 1)[1].strip() for c in tool["args"]["choices"]}
-    assert labels == {"mug", "sugar_box"}
+    assert labels == {"YES", "NO"}
     assert all(c.startswith(("1)", "2)")) for c in tool["args"]["choices"])
