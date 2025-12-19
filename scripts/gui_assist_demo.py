@@ -186,13 +186,40 @@ class OracleBackend(AssistantBackend):
 
 
 class HFBackend(AssistantBackend):
+    """
+    HuggingFace backend that keeps the model loaded across GUI interactions.
+    This makes the "Ask assistance" button responsive and avoids repeated VRAM spikes.
+    """
+
     def __init__(self, cfg: InferenceConfig) -> None:
         self.cfg = cfg
+        self._loaded = False
+        self._model = None
+        self._tok = None
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        from llm.inference import _load_model_and_tokenizer
+
+        self._model, self._tok = _load_model_and_tokenizer(self.cfg)
+        self._loaded = True
 
     def predict(self, input_blob: Dict[str, Any], *, world: GridWorld, state: OracleState) -> Dict[str, Any]:
+        self._ensure_loaded()
+        assert self._model is not None and self._tok is not None
         prompt = f"{INSTRUCTION}\n\nInput:\n{json.dumps(input_blob, ensure_ascii=False)}"
-        out = generate_json_only(prompt, self.cfg)
-        # Enforce contract.
+        # Reuse the already-loaded model/tokenizer.
+        from llm.inference import _build_messages, _generate_once, json_loads_strict
+
+        messages = _build_messages(prompt)
+        raw1 = _generate_once(self._model, self._tok, messages, self.cfg)
+        try:
+            out = json_loads_strict(raw1)
+        except Exception:
+            repair_messages = _build_messages("Return ONLY valid JSON for the previous answer.\n\nPrevious answer:\n" + raw1)
+            raw2 = _generate_once(self._model, self._tok, repair_messages, self.cfg)
+            out = json_loads_strict(raw2)
         validate_tool_call(out)
         return out
 
@@ -212,6 +239,7 @@ def main() -> None:
     ap.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--adapter_path", type=str, default=None)
     ap.add_argument("--merged_model_path", type=str, default=None)
+    ap.add_argument("--use_4bit", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--top_p", type=float, default=0.9)
     ap.add_argument("--max_new_tokens", type=int, default=256)
@@ -250,6 +278,7 @@ def main() -> None:
             model_name=args.model_name,
             adapter_path=args.adapter_path,
             merged_model_path=args.merged_model_path,
+            use_4bit=args.use_4bit,
             temperature=args.temperature,
             top_p=args.top_p,
             max_new_tokens=args.max_new_tokens,
@@ -501,11 +530,14 @@ def main() -> None:
         # Fallback: return the label itself.
         return _strip_choice_label(s)
 
-    def _apply_oracle_user_reply(user_content: str) -> None:
+    def _apply_oracle_user_reply(user_content: str) -> bool:
         """
         Advance the oracle state machine based on the last prompt context and a user reply.
         This mirrors the transitions used by the dataset simulator so the oracle backend
         behaves interactively in the GUI.
+
+        Returns:
+            True if the GUI should immediately auto-continue by calling `ask_assistance()`.
         """
         ctx = state.last_prompt_context or {}
         t = ctx.get("type")

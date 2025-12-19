@@ -17,6 +17,7 @@ class InferenceConfig:
     model_name: str
     adapter_path: Optional[str]
     merged_model_path: Optional[str]
+    use_4bit: bool = False
     temperature: float = 0.2
     top_p: float = 0.9
     max_new_tokens: int = 512
@@ -31,6 +32,7 @@ def _build_messages(prompt: str) -> List[Dict[str, str]]:
 
 
 def _load_model_and_tokenizer(cfg: InferenceConfig):
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_path = cfg.merged_model_path or cfg.model_name
@@ -38,7 +40,30 @@ def _load_model_and_tokenizer(cfg: InferenceConfig):
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, dtype="auto")
+    quant_cfg = None
+    device_map = None
+    if cfg.use_4bit:
+        # Optional dependency; only required for 4-bit inference.
+        try:
+            from transformers import BitsAndBytesConfig
+
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16 if (torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)()) else torch.float16,
+            )
+            device_map = "auto"
+        except Exception as e:
+            raise RuntimeError("use_4bit inference requires bitsandbytes + transformers BitsAndBytesConfig") from e
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        dtype="auto",
+        quantization_config=quant_cfg,
+        device_map=device_map,
+    )
 
     if cfg.adapter_path:
         from peft import PeftModel  # type: ignore[import]
@@ -91,6 +116,7 @@ def main() -> None:
     ap.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--adapter_path", type=str, default=None)
     ap.add_argument("--merged_model_path", type=str, default=None)
+    ap.add_argument("--use_4bit", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--prompt", type=str, default=None)
     ap.add_argument("--prompt_file", type=str, default=None)
     ap.add_argument("--temperature", type=float, default=0.2)
@@ -109,6 +135,7 @@ def main() -> None:
         model_name=args.model_name,
         adapter_path=args.adapter_path,
         merged_model_path=args.merged_model_path,
+        use_4bit=args.use_4bit,
         temperature=args.temperature,
         top_p=args.top_p,
         max_new_tokens=args.max_new_tokens,
