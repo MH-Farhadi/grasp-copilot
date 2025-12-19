@@ -187,14 +187,13 @@ def _simulate_user_response(
         # Allow occasional mismatch to diversify data.
         if rng.random() < 0.15:
             prefer = "ALIGN_YAW" if prefer == "APPROACH" else "APPROACH"
-        # Reply as a number (1 or 2) to mimic real users.
-        resp_num = "1" if prefer == "APPROACH" else "2"
-        append_user(resp_num)
+        # Reply with semantic label (preferred for training).
+        append_user(prefer)
         state.pending_mode = prefer
         state.awaiting_mode_select = False
         state.awaiting_choice = True
     elif ctx.get("type") == "candidate_choice":
-        # Choose which object; respond as the index number.
+        # Choose which object; respond with the semantic label (preferred for training).
         labels = list(ctx.get("labels") or [])
         obj_ids = list(ctx.get("obj_ids") or [])
         none_index = int(ctx.get("none_index") or (len(labels) + 1))
@@ -209,7 +208,7 @@ def _simulate_user_response(
         # If the intended label is not in the current options (or we want to diversify),
         # select "None of them" sometimes, and exclude these ids going forward.
         if (labels and intended_label not in labels and rng.random() < 0.75) or (labels and rng.random() < 0.12):
-            append_user(str(none_index))
+            append_user("None of them")
             ex = set(memory.get("excluded_obj_ids") or [])
             for oid in obj_ids:
                 ex.add(oid)
@@ -232,9 +231,7 @@ def _simulate_user_response(
         else:
             pick_label = _strip_choice_label(rng.choice(tool_call["args"]["choices"]))
 
-        # Find index in labels; fall back to 1.
-        idx = (labels.index(pick_label) + 1) if pick_label in labels else 1
-        append_user(str(idx))
+        append_user(str(pick_label))
 
         # Map to object and update oracle state.
         for o in episode.objects:
@@ -251,11 +248,11 @@ def _simulate_user_response(
             resp = "YES" if rng.random() < 0.55 else "NO"
             append_user(resp)
         else:
-            # Otherwise, respond with a numbered choice if possible.
+            # Otherwise, respond with a semantic label if possible.
             choices = list(tool_call["args"].get("choices", []) or [])
             if choices:
-                idx = rng.randint(1, len(choices))
-                append_user(str(idx))
+                pick = _strip_choice_label(rng.choice(choices))
+                append_user(pick)
 
     state.last_prompt_context = None
 

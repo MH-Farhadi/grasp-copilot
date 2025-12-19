@@ -539,24 +539,12 @@ def main() -> None:
         semantic = _strip_choice_label(s).strip().upper()
         if semantic in {"YES", "NO"}:
             return semantic
-        # Otherwise, if it's a numbered option like "3) mug", return the number.
-        if ")" in s:
-            prefix = s.split(")", 1)[0].strip()
-            if prefix.isdigit():
-                return prefix
-        # Fallback: return the label itself.
-        return _strip_choice_label(s)
+        # Otherwise, return the semantic label (preferred for training).
+        return _strip_choice_label(s).strip()
 
     def _choice_to_user_content_hf(choice_str: str) -> str:
-        """
-        For HF backend, prefer semantic labels over numeric indices so the model can
-        condition on the user's choice without needing the GUI-only button mapping.
-        """
-        semantic = _strip_choice_label(choice_str).strip()
-        up = semantic.upper()
-        if up in {"YES", "NO"}:
-            return up
-        return semantic
+        # Same behavior as oracle: store semantic labels for training consistency.
+        return _choice_to_user_content(choice_str)
 
     def _apply_none_of_them_exclusion_from_last_prompt() -> None:
         """
@@ -652,13 +640,25 @@ def main() -> None:
                 state.pending_mode = None
                 state.selected_obj_id = None
         elif t == "candidate_choice":
-            # user_content is expected to be a number string.
             labels: List[str] = list(ctx.get("labels") or [])
             obj_ids: List[str] = list(ctx.get("obj_ids") or [])
             none_index = int(ctx.get("none_index") or (len(labels) + 1))
-            if user_content.isdigit():
+            # Support label replies (preferred for training), numeric replies (backward compat),
+            # and "None of them" iterative exclusion.
+            if user_content.strip().lower() == "none of them":
+                ex = set(memory.get("excluded_obj_ids") or [])
+                for oid in obj_ids:
+                    ex.add(oid)
+                memory["excluded_obj_ids"] = sorted(ex)
+                state.selected_obj_id = None
+                state.awaiting_choice = True
+                state.awaiting_confirmation = False
+            elif user_content in labels:
+                set_selected_by_label(user_content)
+                state.awaiting_choice = False
+                state.awaiting_confirmation = False
+            elif user_content.isdigit():
                 idx = int(user_content) - 1
-                # If user picked "None of them", exclude these obj ids and ask again.
                 if int(user_content) == none_index:
                     ex = set(memory.get("excluded_obj_ids") or [])
                     for oid in obj_ids:
@@ -711,8 +711,11 @@ def main() -> None:
                 status.set("Okay — no assistance. You can press 'Ask assistance' anytime.")
                 auto_continue = False
         elif t == "mode_select":
-            # user_content is "1" or "2"
-            if user_content == "1":
+            # Prefer semantic replies ("APPROACH"/"ALIGN_YAW"), but accept numeric for compatibility.
+            uc = user_content.strip().upper()
+            if uc in {"APPROACH", "ALIGN_YAW"}:
+                state.pending_mode = uc
+            elif user_content == "1":
                 state.pending_mode = "APPROACH"
             elif user_content == "2":
                 state.pending_mode = "ALIGN_YAW"
@@ -742,7 +745,9 @@ def main() -> None:
         else:
             auto_continue = True
             # For HF backend, maintain exclusions when user clicks "None of them".
-            if user_content.strip().lower() == "none of them":
+            # user_content may be a number ("5") if the choice was "5) None of them".
+            semantic = _strip_choice_label(choice_str).strip().lower()
+            if semantic == "none of them":
                 _apply_none_of_them_exclusion_from_last_prompt()
 
         clear_choices()
@@ -778,6 +783,30 @@ def main() -> None:
             push_assistant_dialog(text)
             # Store the last prompt + choices in memory for better interactive behavior.
             memory["last_prompt"] = {"kind": tool_call["args"]["kind"], "text": text, "choices": list(choices)}
+
+            # UI policy: show at most 4 object options (plus optional "None of them").
+            # If the model returns more, truncate for readability.
+            obj_opts: List[str] = []
+            none_opt: Optional[str] = None
+            for c in list(choices):
+                lab = _strip_choice_label(str(c)).strip().lower()
+                if lab == "none of them":
+                    none_opt = str(c)
+                elif lab in {"yes", "no"}:
+                    obj_opts.append(str(c))
+                else:
+                    obj_opts.append(str(c))
+            # Only truncate for non-YES/NO menus (heuristic: contains some non-yes/no labels).
+            is_yes_no_only = all(_strip_choice_label(str(c)).strip().upper() in {"YES", "NO"} for c in choices)
+            if not is_yes_no_only:
+                # Separate object labels from yes/no, then cap objects at 4.
+                yes_no = [c for c in obj_opts if _strip_choice_label(str(c)).strip().upper() in {"YES", "NO"}]
+                objs = [c for c in obj_opts if _strip_choice_label(str(c)).strip().upper() not in {"YES", "NO"} and _strip_choice_label(str(c)).strip().lower() != "none of them"]
+                objs = objs[:4]
+                new_choices: List[str] = yes_no + objs
+                if none_opt is not None:
+                    new_choices.append(none_opt)
+                choices = new_choices
             # Render choices as buttons.
             for c in choices:
                 ttk.Button(
