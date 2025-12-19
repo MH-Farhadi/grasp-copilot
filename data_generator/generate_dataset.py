@@ -16,6 +16,7 @@ def _deepcopy_memory(mem: Dict) -> Dict:
         "past_dialogs": list(mem["past_dialogs"]),
         "candidates": list(mem["candidates"]),
         "last_tool_calls": list(mem["last_tool_calls"]),
+        "excluded_obj_ids": list(mem.get("excluded_obj_ids") or []),
     }
 
 
@@ -176,6 +177,8 @@ def _simulate_user_response(
     elif ctx.get("type") == "candidate_choice":
         # Choose which object; respond as the index number.
         labels = list(ctx.get("labels") or [])
+        obj_ids = list(ctx.get("obj_ids") or [])
+        none_index = int(ctx.get("none_index") or (len(labels) + 1))
         intended_label = episode.intended_obj().label
         declined_label: Optional[str] = None
         if state.last_declined_obj_id is not None:
@@ -183,6 +186,20 @@ def _simulate_user_response(
                 if o.id == state.last_declined_obj_id:
                     declined_label = o.label
                     break
+
+        # If the intended label is not in the current options (or we want to diversify),
+        # select "None of them" sometimes, and exclude these ids going forward.
+        if (labels and intended_label not in labels and rng.random() < 0.75) or (labels and rng.random() < 0.12):
+            append_user(str(none_index))
+            ex = set(memory.get("excluded_obj_ids") or [])
+            for oid in obj_ids:
+                ex.add(oid)
+            memory["excluded_obj_ids"] = sorted(ex)
+            state.awaiting_choice = True
+            state.awaiting_confirmation = False
+            state.selected_obj_id = None
+            state.last_prompt_context = None
+            return
 
         pick_label: Optional[str] = None
         if labels and intended_label in labels and rng.random() < 0.8:
@@ -257,6 +274,7 @@ def generate(
             "past_dialogs": [],
             "candidates": ep.gripper_candidates(max_dist=candidate_max_dist),
             "last_tool_calls": [],
+            "excluded_obj_ids": [],
         }
 
         for t in range(ep.T):

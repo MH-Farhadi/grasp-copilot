@@ -222,7 +222,13 @@ def main() -> None:
     def new_world() -> Tuple[GridWorld, OracleState, Dict[str, Any]]:
         w = GridWorld(rng, n_obj=args.n_obj, collision_p=args.collision_p)
         st = OracleState(intended_obj_id=w.intended_obj_id)
-        mem: Dict[str, Any] = {"n_interactions": 0, "past_dialogs": [], "candidates": [], "last_tool_calls": []}
+        mem: Dict[str, Any] = {
+            "n_interactions": 0,
+            "past_dialogs": [],
+            "candidates": [],
+            "last_tool_calls": [],
+            "excluded_obj_ids": [],
+        }
         mem["candidates"] = w.candidates(args.candidate_max_dist)
         return w, st, mem
 
@@ -478,6 +484,27 @@ def main() -> None:
         ctx = state.last_prompt_context or {}
         t = ctx.get("type")
 
+        def reset_conversation_only() -> None:
+            # Keep the world/gripper as-is, but reset assistant memory + oracle state so
+            # the user can ask for assistance again later.
+            memory["n_interactions"] = 0
+            memory["past_dialogs"] = []
+            memory["last_tool_calls"] = []
+            memory["excluded_obj_ids"] = []
+            update_candidates()
+            state.intended_obj_id = world.intended_obj_id
+            state.selected_obj_id = None
+            state.pending_action_obj_id = None
+            state.pending_mode = None
+            state.awaiting_confirmation = False
+            state.awaiting_help = False
+            state.awaiting_choice = False
+            state.awaiting_intent_gate = False
+            state.awaiting_anything_else = False
+            state.awaiting_mode_select = False
+            state.terminate_episode = False
+            state.last_prompt_context = None
+
         def set_selected_by_label(label: str) -> None:
             for o in world.objects:
                 if o.label == label:
@@ -485,6 +512,8 @@ def main() -> None:
                     # Treat selection as the new goal, matching generator behavior.
                     state.intended_obj_id = o.id
                     return
+
+        auto_continue = True
 
         if t == "intent_gate_candidates":
             if user_content.upper() == "YES":
@@ -514,12 +543,24 @@ def main() -> None:
         elif t == "candidate_choice":
             # user_content is expected to be a number string.
             labels: List[str] = list(ctx.get("labels") or [])
+            obj_ids: List[str] = list(ctx.get("obj_ids") or [])
+            none_index = int(ctx.get("none_index") or (len(labels) + 1))
             if user_content.isdigit():
                 idx = int(user_content) - 1
-                if 0 <= idx < len(labels):
-                    set_selected_by_label(labels[idx])
-            state.awaiting_choice = False
-            state.awaiting_confirmation = False
+                # If user picked "None of them", exclude these obj ids and ask again.
+                if int(user_content) == none_index:
+                    ex = set(memory.get("excluded_obj_ids") or [])
+                    for oid in obj_ids:
+                        ex.add(oid)
+                    memory["excluded_obj_ids"] = sorted(ex)
+                    state.selected_obj_id = None
+                    state.awaiting_choice = True
+                    state.awaiting_confirmation = False
+                else:
+                    if 0 <= idx < len(labels):
+                        set_selected_by_label(labels[idx])
+                    state.awaiting_choice = False
+                    state.awaiting_confirmation = False
         elif t == "confirm":
             obj_id = ctx.get("obj_id")
             action = str(ctx.get("action") or "").upper()
@@ -552,8 +593,12 @@ def main() -> None:
                 state.awaiting_mode_select = True
                 state.awaiting_anything_else = False
             else:
-                state.terminate_episode = True
-                state.awaiting_anything_else = False
+                # In the dataset generator we can terminate the episode, but in the GUI we
+                # want "NO" to simply end the current assistance session while still letting
+                # the user ask again later.
+                reset_conversation_only()
+                status.set("Okay — no assistance. You can press 'Ask assistance' anytime.")
+                auto_continue = False
         elif t == "mode_select":
             # user_content is "1" or "2"
             if user_content == "1":
@@ -562,23 +607,31 @@ def main() -> None:
                 state.pending_mode = "ALIGN_YAW"
             state.awaiting_mode_select = False
             state.awaiting_choice = True
+        elif t == "terminal_ack":
+            reset_conversation_only()
+            status.set("Okay. You can press 'Ask assistance' anytime.")
+            auto_continue = False
 
         # Consume the prompt context once applied.
         state.last_prompt_context = None
+        return auto_continue
 
     def on_choice_clicked(choice_str: str) -> None:
         user_content = _choice_to_user_content(choice_str)
         push_user_dialog(user_content)
 
         if args.backend == "oracle":
-            _apply_oracle_user_reply(user_content)
+            auto_continue = _apply_oracle_user_reply(user_content)
+        else:
+            auto_continue = True
 
         clear_choices()
         update_candidates()
         redraw()
 
         # Auto-continue one step so the user immediately sees the next question/action.
-        ask_assistance()
+        if auto_continue:
+            ask_assistance()
 
     def ask_assistance() -> None:
         clear_choices()

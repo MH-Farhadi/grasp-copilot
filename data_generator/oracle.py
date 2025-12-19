@@ -104,6 +104,9 @@ def _emit_intent_gate(objects: Sequence[Dict], gripper_hist: Sequence[Dict], mem
     """
     current_cell = gripper_hist[-1]["cell"]
     candidates = list(memory.get("candidates", []))
+    excluded_obj_ids = set(memory.get("excluded_obj_ids") or [])
+    if excluded_obj_ids:
+        candidates = [c for c in candidates if c not in excluded_obj_ids]
 
     # Prefer candidate-based intent gating.
     ranked = _rank_candidates(objects, candidates, current_cell)
@@ -139,6 +142,9 @@ def _emit_intent_gate(objects: Sequence[Dict], gripper_hist: Sequence[Dict], mem
 def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], memory: Dict, state: OracleState) -> Dict:
     current_cell = gripper_hist[-1]["cell"]
     candidates = list(memory.get("candidates", []))
+    excluded_obj_ids = set(memory.get("excluded_obj_ids") or [])
+    if excluded_obj_ids:
+        candidates = [c for c in candidates if c not in excluded_obj_ids]
     objects_by_id = {o["id"]: o for o in objects}
     current_yaw = gripper_hist[-1]["yaw"]
 
@@ -211,8 +217,12 @@ def oracle_decide_tool(objects: Sequence[Dict], gripper_hist: Sequence[Dict], me
         if ranked:
             k = min(4, len(ranked))
             labels = [ranked[i]["label"] for i in range(k)]
+            obj_ids = [ranked[i]["id"] for i in range(k)]
             choices = [f"{i+1}) {labels[i]}" for i in range(k)]
-            context = {"type": "candidate_choice", "labels": labels}
+            # Always include an explicit "none" option to support iterative exclusion.
+            none_idx = k + 1
+            choices.append(f"{none_idx}) None of them")
+            context = {"type": "candidate_choice", "labels": labels, "obj_ids": obj_ids, "none_index": none_idx}
             return _interact("QUESTION", "Uh, which one do you want?", choices, context, state)
         state.awaiting_choice = False
 
