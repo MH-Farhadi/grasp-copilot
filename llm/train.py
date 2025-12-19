@@ -33,6 +33,8 @@ class TrainArgs:
     gradient_accumulation_steps: int = 16
     lr: float = 2e-4
     num_train_epochs: float = 1.0
+    # If > 0, overrides num_train_epochs and trains for exactly this many optimizer steps.
+    max_steps: int = -1
     # Slightly smaller LoRA reduces VRAM/CPU overhead while keeping decent quality.
     lora_r: int = 8
     lora_alpha: int = 16
@@ -194,6 +196,7 @@ def train_sft_lora(args: TrainArgs) -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr,
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
         logging_steps=args.logging_steps,
         warmup_ratio=args.warmup_ratio,
         report_to=args.report_to,
@@ -336,6 +339,7 @@ def main() -> None:
     ap.add_argument("--gradient_accumulation_steps", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--num_train_epochs", type=float, default=1.0)
+    ap.add_argument("--max_steps", type=int, default=-1, help="If > 0, train for exactly this many optimizer steps (overrides epochs).")
     ap.add_argument("--lora_r", type=int, default=8)
     ap.add_argument("--lora_alpha", type=int, default=16)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
@@ -366,6 +370,7 @@ def main() -> None:
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             lr=args.lr,
             num_train_epochs=args.num_train_epochs,
+            max_steps=args.max_steps,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,

@@ -75,10 +75,82 @@ python scripts/prepare_llm_data.py --generator_jsonl data.jsonl --out_contract l
 
 ### Train SFT + LoRA / QLoRA
 
+All commands must activate the `talm` environment first:
+
 ```bash
 conda activate talm
-python scripts/train_sft_lora.py --train_path llm_contract.jsonl --valid_path llm_contract.jsonl --output_dir outputs/qwen_lora --model_name Qwen/Qwen2.5-7B-Instruct --use_4bit
+python scripts/train_sft_lora.py --help
 ```
+
+#### Quick recipes
+
+- **Smoke run (a few steps, no eval, no checkpoints)**
+
+```bash
+conda activate talm
+python scripts/train_sft_lora.py \
+  --train_path llm_contract.jsonl \
+  --output_dir outputs/qwen_lora_smoke \
+  --max_steps 20 \
+  --logging_steps 1 \
+  --save_strategy no \
+  --disable_eval
+```
+
+- **Typical training run (with eval, still memory-safe defaults)**
+
+```bash
+conda activate talm
+python scripts/train_sft_lora.py \
+  --train_path llm_contract.jsonl \
+  --valid_path llm_contract.jsonl \
+  --output_dir outputs/qwen_lora
+```
+
+- **If you hit CUDA OOM**
+  - Reduce context: `--max_seq_length 512` (or `256`)
+  - Disable eval: `--disable_eval` (evaluation is often the OOM trigger)
+  - Keep QLoRA: ensure you did not pass `--no-use_4bit`
+
+#### `train_sft_lora.py` arguments (what they do)
+
+- **Data / I/O**
+  - **`--train_path`**: Path to the *contract* JSONL used for training (see “Prepare LLM data”).
+  - **`--valid_path`**: Optional contract JSONL used for evaluation (ignored if `--disable_eval`).
+  - **`--output_dir`**: Where the LoRA adapter is written via `save_pretrained()` at the end of training.
+
+- **Model / memory**
+  - **`--model_name`**: Base HF model id (default: `Qwen/Qwen2.5-7B-Instruct`).
+  - **`--use_4bit` / `--no-use_4bit`**: Enable/disable 4-bit loading (QLoRA). 4-bit is the most reliable way to fit 7B models on ~16GB GPUs.
+  - **`--max_seq_length`**: Max sequence length for SFT (bigger = more VRAM; if OOM, reduce).
+
+- **Training loop**
+  - **`--per_device_train_batch_size`**: Micro-batch size on each GPU.
+  - **`--gradient_accumulation_steps`**: Accumulate gradients to simulate a larger batch without increasing VRAM.
+  - **`--lr`**: Learning rate.
+  - **`--num_train_epochs`**: Number of passes over the dataset (ignored if `--max_steps > 0`).
+  - **`--max_steps`**: If `> 0`, train for exactly this many optimizer steps (best for quick tests).
+  - **`--seed`**: Random seed.
+
+- **LoRA config**
+  - **`--lora_r`**, **`--lora_alpha`**, **`--lora_dropout`**: Standard LoRA hyperparameters.
+
+- **Evaluation (memory sensitive)**
+  - **`--disable_eval`**: Turn evaluation off entirely (ignores `--valid_path`).
+  - **`--per_device_eval_batch_size`**: Eval micro-batch size (keep at `1` if close to VRAM limit).
+  - **`--eval_steps`**: Evaluate every N steps (only used when eval is enabled).
+  - **`--eval_accumulation_steps`**: Reduces peak memory when evaluating large sets.
+  - **`--prediction_loss_only` / `--no-prediction_loss_only`**: If enabled, avoids storing full logits during eval (much lower VRAM).
+
+- **Checkpointing / logging**
+  - **`--save_strategy {no,steps,epoch}`**: Whether to save intermediate checkpoints.
+    - Recommended: `no` (final adapter is saved at the end anyway).
+  - **`--save_steps`**: Steps between checkpoints (when `save_strategy=steps`).
+  - **`--save_only_model`**: Save only model weights (avoids huge optimizer checkpoints).
+  - **`--save_total_limit`**: Keep at most this many checkpoints.
+  - **`--logging_steps`**: Log every N steps.
+  - **`--warmup_ratio`**: LR warmup ratio.
+  - **`--report_to`**: Logging backend (default: `none`).
 
 ### Merge LoRA (optional)
 
