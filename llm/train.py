@@ -25,22 +25,31 @@ class TrainArgs:
     train_path: str = ""
     valid_path: Optional[str] = None
     output_dir: str = "outputs/lora"
-    max_seq_length: int = 2048
+    # NOTE: 2048 can OOM on ~16GB GPUs depending on model + eval settings.
+    # 1024 is a safer default; you can still pass --max_seq_length 2048 explicitly.
+    max_seq_length: int = 1024
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 16
     lr: float = 2e-4
     num_train_epochs: float = 1.0
-    lora_r: int = 16
-    lora_alpha: int = 32
+    # Slightly smaller LoRA reduces VRAM/CPU overhead while keeping decent quality.
+    lora_r: int = 8
+    lora_alpha: int = 16
     lora_dropout: float = 0.05
-    use_4bit: bool = False
+    # 4-bit is the most reliable way to fit 7B models on ~16GB GPUs.
+    use_4bit: bool = True
     seed: int = 0
     eval_steps: int = 200
     eval_accumulation_steps: int = 1
     prediction_loss_only: bool = True
     disable_eval: bool = False
+    # Avoid large checkpoint artifacts (optimizer/scheduler state) by default.
+    # We'll still save the final adapter via model.save_pretrained() at the end.
+    save_strategy: str = "no"  # "no" | "steps" | "epoch"
     save_steps: int = 200
+    save_only_model: bool = True
+    save_total_limit: int = 2
     logging_steps: int = 20
     warmup_ratio: float = 0.03
     report_to: str = "none"
@@ -185,7 +194,6 @@ def train_sft_lora(args: TrainArgs) -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr,
         num_train_epochs=args.num_train_epochs,
-        save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         warmup_ratio=args.warmup_ratio,
         report_to=args.report_to,
@@ -193,11 +201,18 @@ def train_sft_lora(args: TrainArgs) -> None:
         fp16=bool(torch.cuda.is_available() and not use_bf16),
         bf16=bool(torch.cuda.is_available() and use_bf16),
         remove_unused_columns=False,
+        gradient_checkpointing=True,
         # Reduce eval memory pressure: don't gather/store full logits unless needed.
         prediction_loss_only=args.prediction_loss_only,
         # Reduce eval host/GPU memory when eval sets are large.
         eval_accumulation_steps=args.eval_accumulation_steps,
     )
+    # Checkpointing: default to "no" to avoid huge optimizer checkpoints; always save final adapter ourselves.
+    if args.save_strategy != "no":
+        targs_kwargs["save_strategy"] = args.save_strategy
+        targs_kwargs["save_steps"] = args.save_steps
+        targs_kwargs["save_total_limit"] = args.save_total_limit
+        targs_kwargs["save_only_model"] = args.save_only_model
     if eval_ds is not None:
         targs_kwargs["eval_steps"] = args.eval_steps
 
@@ -315,22 +330,25 @@ def main() -> None:
     ap.add_argument("--train_path", type=str, required=True)
     ap.add_argument("--valid_path", type=str, default=None)
     ap.add_argument("--output_dir", type=str, required=True)
-    ap.add_argument("--max_seq_length", type=int, default=2048)
+    ap.add_argument("--max_seq_length", type=int, default=1024)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
     ap.add_argument("--per_device_eval_batch_size", type=int, default=1)
-    ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--num_train_epochs", type=float, default=1.0)
-    ap.add_argument("--lora_r", type=int, default=16)
-    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_r", type=int, default=8)
+    ap.add_argument("--lora_alpha", type=int, default=16)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
-    ap.add_argument("--use_4bit", action="store_true")
+    ap.add_argument("--use_4bit", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eval_steps", type=int, default=200)
     ap.add_argument("--eval_accumulation_steps", type=int, default=1)
     ap.add_argument("--prediction_loss_only", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--disable_eval", action="store_true", help="If set, ignore --valid_path and do not run evaluation during training.")
+    ap.add_argument("--save_strategy", type=str, default="no", choices=["no", "steps", "epoch"])
     ap.add_argument("--save_steps", type=int, default=200)
+    ap.add_argument("--save_only_model", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--save_total_limit", type=int, default=2)
     ap.add_argument("--logging_steps", type=int, default=20)
     ap.add_argument("--warmup_ratio", type=float, default=0.03)
     ap.add_argument("--report_to", type=str, default="none")
@@ -357,7 +375,10 @@ def main() -> None:
             eval_accumulation_steps=args.eval_accumulation_steps,
             prediction_loss_only=args.prediction_loss_only,
             disable_eval=args.disable_eval,
+            save_strategy=args.save_strategy,
             save_steps=args.save_steps,
+            save_only_model=args.save_only_model,
+            save_total_limit=args.save_total_limit,
             logging_steps=args.logging_steps,
             warmup_ratio=args.warmup_ratio,
             report_to=args.report_to,
