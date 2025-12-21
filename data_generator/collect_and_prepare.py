@@ -8,6 +8,7 @@ from typing import Optional
 
 from .episode import write_jsonl
 from .generate_dataset import generate as generate_records
+from .run_dirs import allocate_numbered_run_dir
 
 
 def _default_paths(out_dir: str) -> tuple[str, str, str]:
@@ -49,7 +50,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--out_dir",
         type=str,
         default=None,
-        help="Directory to write outputs (defaults to current working directory).",
+        help=(
+            "Directory to write outputs. If omitted, a unique numbered directory is created under "
+            "grasp-copilot/data/runs/ (e.g. 001, 002, ...)."
+        ),
     )
     ap.add_argument("--out_generator", type=str, default=None, help="Path to write the raw generator JSONL.")
     ap.add_argument("--out_contract", type=str, default=None, help="Path to write dataset-contract JSONL.")
@@ -69,7 +73,14 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     args = ap.parse_args(argv)
 
-    out_dir = str(args.out_dir or ".")
+    if args.out_dir:
+        out_dir_path = Path(str(args.out_dir))
+        out_dir_path.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir_path = allocate_numbered_run_dir()
+        print(f"[collect] out_dir: {out_dir_path}")
+
+    out_dir = str(out_dir_path)
     out_gen_default, out_contract_default, out_chat_default = _default_paths(out_dir)
 
     out_generator = str(args.out_generator or out_gen_default)
