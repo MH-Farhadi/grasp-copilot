@@ -96,6 +96,14 @@ def _default_output_dir(*, model_name: str, train_path: str, root: str = "models
     return os.path.join(root, f"{slug}_lora")
 
 
+def _default_merged_output_dir(*, model_name: str, train_path: str, root: str = "models") -> str:
+    slug = _model_slug(model_name)
+    run_id = _extract_run_id_from_train_path(train_path)
+    if run_id is not None:
+        return os.path.join(root, f"{slug}_merged_{run_id}")
+    return os.path.join(root, f"{slug}_merged")
+
+
 def _make_peft_config(args: TrainArgs):
     from peft import LoraConfig  # type: ignore[import]
 
@@ -403,6 +411,21 @@ def main() -> None:
     ap.add_argument("--logging_steps", type=int, default=20)
     ap.add_argument("--warmup_ratio", type=float, default=0.03)
     ap.add_argument("--report_to", type=str, default="none")
+    ap.add_argument(
+        "--merge_at_end",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If set, automatically merge the trained LoRA adapter into a standalone model at the end "
+            "of training (writes a full merged model directory). Disable with --no-merge_at_end."
+        ),
+    )
+    ap.add_argument(
+        "--merged_output_dir",
+        type=str,
+        default=None,
+        help="Where to write the merged standalone model (defaults to models/<model>_merged_<run_id>).",
+    )
     args = ap.parse_args()
 
     output_dir = str(args.output_dir) if args.output_dir else _default_output_dir(model_name=args.model_name, train_path=args.train_path)
@@ -440,6 +463,16 @@ def main() -> None:
             report_to=args.report_to,
         )
     )
+
+    if bool(args.merge_at_end):
+        merged_dir = str(args.merged_output_dir) if args.merged_output_dir else _default_merged_output_dir(model_name=args.model_name, train_path=args.train_path)
+        if args.merged_output_dir is None:
+            print(f"[train] merged_output_dir: {merged_dir}")
+        try:
+            merge_lora(base_model_name=args.model_name, adapter_dir=output_dir, output_dir=merged_dir)
+        except Exception as e:
+            # Fail-soft: training artifacts (adapter) are still usable even if merge fails.
+            print(f"[train] WARNING: merge_lora failed: {e}")
 
 
 if __name__ == "__main__":
