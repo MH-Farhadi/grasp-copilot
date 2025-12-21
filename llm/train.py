@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -17,6 +19,8 @@ if TYPE_CHECKING:
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
+
+_NON_ALNUM = re.compile(r"[^a-zA-Z0-9]+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +59,41 @@ class TrainArgs:
     logging_steps: int = 20
     warmup_ratio: float = 0.03
     report_to: str = "none"
+
+
+def _model_slug(model_name: str) -> str:
+    """
+    Turn HF model id into a filesystem-friendly slug.
+    Example: "Qwen/Qwen3-0.6B" -> "qwen3_0_6b"
+    """
+    base = str(model_name).strip().split("/")[-1]
+    base = _NON_ALNUM.sub("_", base).strip("_").lower()
+    return base or "model"
+
+
+def _extract_run_id_from_train_path(train_path: str) -> Optional[str]:
+    """
+    Detect data run id from paths like:
+      grasp-copilot/data/runs/002/llm_contract.jsonl
+      data/runs/002/llm_contract.jsonl
+    Returns "002" if found.
+    """
+    p = Path(str(train_path))
+    parts = list(p.parts)
+    for i in range(len(parts) - 2):
+        if parts[i] == "data" and parts[i + 1] == "runs":
+            run = parts[i + 2]
+            if run.isdigit():
+                return run.zfill(3)
+    return None
+
+
+def _default_output_dir(*, model_name: str, train_path: str, root: str = "models") -> str:
+    slug = _model_slug(model_name)
+    run_id = _extract_run_id_from_train_path(train_path)
+    if run_id is not None:
+        return os.path.join(root, f"{slug}_lora_{run_id}")
+    return os.path.join(root, f"{slug}_lora")
 
 
 def _make_peft_config(args: TrainArgs):
@@ -121,7 +160,7 @@ def train_sft_lora(args: TrainArgs) -> None:
     if args.valid_path:
         data_lib.validate_dataset_contract_jsonl(args.valid_path)
 
-    from datasets import load_dataset
+    from datasets import load_dataset  # type: ignore[import]
     from peft import get_peft_model, prepare_model_for_kbit_training  # type: ignore[import]
     from transformers import TrainingArguments
 
@@ -332,7 +371,15 @@ def main() -> None:
     ap.add_argument("--model_name", type=str, default=DEFAULT_MODEL)
     ap.add_argument("--train_path", type=str, required=True)
     ap.add_argument("--valid_path", type=str, default=None)
-    ap.add_argument("--output_dir", type=str, required=True)
+    ap.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help=(
+            "Where to write the LoRA adapter. If omitted, it is auto-derived from --train_path "
+            "as models/<model>_lora_<run_id> when training on data/runs/<run_id>/..."
+        ),
+    )
     ap.add_argument("--max_seq_length", type=int, default=1024)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
     ap.add_argument("--per_device_eval_batch_size", type=int, default=1)
@@ -358,12 +405,16 @@ def main() -> None:
     ap.add_argument("--report_to", type=str, default="none")
     args = ap.parse_args()
 
+    output_dir = str(args.output_dir) if args.output_dir else _default_output_dir(model_name=args.model_name, train_path=args.train_path)
+    if args.output_dir is None:
+        print(f"[train] output_dir: {output_dir}")
+
     train_sft_lora(
         TrainArgs(
             model_name=args.model_name,
             train_path=args.train_path,
             valid_path=args.valid_path,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
             max_seq_length=args.max_seq_length,
             per_device_train_batch_size=args.per_device_train_batch_size,
             per_device_eval_batch_size=args.per_device_eval_batch_size,
