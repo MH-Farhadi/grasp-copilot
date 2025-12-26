@@ -209,7 +209,65 @@ class HFBackend(AssistantBackend):
     def predict(self, input_blob: Dict[str, Any], *, world: GridWorld, state: OracleState) -> Dict[str, Any]:
         self._ensure_loaded()
         assert self._model is not None and self._tok is not None
-        prompt = f"{INSTRUCTION}\n\nInput:\n{json.dumps(input_blob, ensure_ascii=False)}"
+
+        def _filter_memory_for_model(mem: Any) -> Any:
+            """
+            Keep GUI inference input aligned with training schema.
+            Training uses memory keys: n_interactions, past_dialogs, candidates, last_tool_calls, excluded_obj_ids, last_action.
+            The GUI runtime may add extra keys (e.g., last_prompt/user_state) that the model never saw during training.
+            """
+            if not isinstance(mem, dict):
+                return mem
+            keep = {
+                "n_interactions",
+                "past_dialogs",
+                "candidates",
+                "last_tool_calls",
+                "excluded_obj_ids",
+                "last_action",
+            }
+            return {k: mem.get(k) for k in keep if k in mem}
+
+        def _extract_first_json_object(s: str) -> Optional[str]:
+            """
+            Best-effort extraction of the first {...} JSON object from a model string.
+            Helps when the model outputs valid JSON plus trailing commentary (common with small models).
+            """
+            if not isinstance(s, str):
+                return None
+            start = s.find("{")
+            if start < 0:
+                return None
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                else:
+                    if ch == '"':
+                        in_str = True
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return s[start : i + 1]
+            return None
+
+        # Align input schema with training (important for small models).
+        model_input = dict(input_blob)
+        model_input["memory"] = _filter_memory_for_model(model_input.get("memory"))
+
+        prompt = f"{INSTRUCTION}\n\nInput:\n{json.dumps(model_input, ensure_ascii=False)}"
         # Reuse the already-loaded model/tokenizer.
         from llm.inference import _build_messages, _generate_once, json_loads_strict
 
@@ -218,9 +276,27 @@ class HFBackend(AssistantBackend):
         try:
             out = json_loads_strict(raw1)
         except Exception:
+            # If it's "JSON + extra data", try extracting the first object before asking for repair.
+            extracted = _extract_first_json_object(raw1)
+            if extracted:
+                try:
+                    out = json_loads_strict(extracted)
+                except Exception:
+                    out = None
+            else:
+                out = None
+
+        if out is None:
             repair_messages = _build_messages("Return ONLY valid JSON for the previous answer.\n\nPrevious answer:\n" + raw1)
             raw2 = _generate_once(self._model, self._tok, repair_messages, self.cfg)
-            out = json_loads_strict(raw2)
+            try:
+                out = json_loads_strict(raw2)
+            except Exception:
+                extracted2 = _extract_first_json_object(raw2)
+                if extracted2:
+                    out = json_loads_strict(extracted2)
+                else:
+                    raise
 
         # Be tolerant of extra keys inside args (models sometimes emit additional metadata).
         # For GUI usage, we strip to the minimal schema before validating.
@@ -258,6 +334,11 @@ def main() -> None:
     ap.add_argument("--top_p", type=float, default=0.9)
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Make HF backend as deterministic as possible (forces greedy decoding + deterministic torch settings).",
+    )
     ap.add_argument("--n_obj", type=int, default=8)
     ap.add_argument("--collision_p", type=float, default=0.2)
     ap.add_argument("--candidate_max_dist", type=int, default=2)
@@ -288,6 +369,10 @@ def main() -> None:
     if args.backend == "oracle":
         backend: AssistantBackend = OracleBackend()
     else:
+        if args.deterministic:
+            # Force greedy decoding for stable debugging.
+            args.temperature = 0.0
+            args.top_p = 1.0
         cfg = InferenceConfig(
             model_name=args.model_name,
             adapter_path=args.adapter_path,
@@ -297,6 +382,7 @@ def main() -> None:
             top_p=args.top_p,
             max_new_tokens=args.max_new_tokens,
             seed=args.seed,
+            deterministic=bool(args.deterministic),
         )
         backend = HFBackend(cfg)
 

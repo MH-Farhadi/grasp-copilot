@@ -22,6 +22,7 @@ class InferenceConfig:
     top_p: float = 0.9
     max_new_tokens: int = 512
     seed: int = 0
+    deterministic: bool = False
 
 
 def _build_messages(prompt: str) -> List[Dict[str, str]]:
@@ -109,6 +110,20 @@ def _generate_once(model, tok, messages: List[Dict[str, str]], cfg: InferenceCon
 
 def generate_json_only(prompt: str, cfg: InferenceConfig) -> Dict[str, Any]:
     set_seed(cfg.seed)
+    if cfg.deterministic:
+        # Best-effort determinism. Note: some GPU ops may still be nondeterministic depending on
+        # hardware/driver/torch version. This is mainly for repeatable debugging.
+        try:
+            import torch
+
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass
+        except Exception:
+            pass
     model, tok = _load_model_and_tokenizer(cfg)
 
     messages = _build_messages(prompt)
@@ -136,6 +151,11 @@ def main() -> None:
     ap.add_argument("--top_p", type=float, default=0.9)
     ap.add_argument("--max_new_tokens", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Best-effort deterministic inference (disables cudnn benchmark, enables deterministic algorithms).",
+    )
     args = ap.parse_args()
 
     if (args.prompt is None) == (args.prompt_file is None):
@@ -153,6 +173,7 @@ def main() -> None:
         top_p=args.top_p,
         max_new_tokens=args.max_new_tokens,
         seed=args.seed,
+        deterministic=bool(args.deterministic),
     )
     obj = generate_json_only(prompt, cfg)
     print(json.dumps(obj, ensure_ascii=False))
