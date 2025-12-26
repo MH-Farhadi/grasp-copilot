@@ -18,7 +18,8 @@ if TYPE_CHECKING:
     from peft import get_peft_model, prepare_model_for_kbit_training  # type: ignore[import]
 
 
-DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
+DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+DEFAULT_VALID_FRACTION = 0.05
 
 _NON_ALNUM = re.compile(r"[^a-zA-Z0-9]+")
 
@@ -191,8 +192,25 @@ def train_sft_lora(args: TrainArgs) -> None:
 
     train_ds = load_dataset("json", data_files=args.train_path, split="train")
     eval_ds = None
-    if args.valid_path and not args.disable_eval:
-        eval_ds = load_dataset("json", data_files=args.valid_path, split="train")
+    if not args.disable_eval:
+        if args.valid_path:
+            eval_ds = load_dataset("json", data_files=args.valid_path, split="train")
+        else:
+            # Default behavior: create a small validation split from the training file.
+            # This is crucial for tracking overfitting/regressions without requiring extra args.
+            n = len(train_ds)
+            if n >= 2:
+                # Use at least 1 example for eval, but never take all examples.
+                n_eval = max(1, int(round(n * DEFAULT_VALID_FRACTION)))
+                n_eval = min(n_eval, n - 1)
+                try:
+                    split = train_ds.train_test_split(test_size=n_eval, seed=args.seed, shuffle=True)
+                    train_ds = split["train"]
+                    eval_ds = split["test"]
+                    print(f"[train] auto valid split: {len(train_ds)} train / {len(eval_ds)} valid (from {n})")
+                except Exception:
+                    # Fallback: some dataset backends may not support split.
+                    eval_ds = None
 
     def to_messages(batch):
         msgs = []
@@ -406,7 +424,7 @@ def main() -> None:
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
     ap.add_argument("--per_device_eval_batch_size", type=int, default=1)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--num_train_epochs", type=float, default=1.0)
     ap.add_argument("--max_steps", type=int, default=-1, help="If > 0, train for exactly this many optimizer steps (overrides epochs).")
     ap.add_argument("--lora_r", type=int, default=8)
