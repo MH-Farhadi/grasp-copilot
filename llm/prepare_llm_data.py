@@ -4,6 +4,7 @@ import argparse
 from typing import Optional
 
 from .data import convert_contract_to_qwen_chat_jsonl, convert_generator_jsonl_to_contract
+from .rebalance_contract import rebalance_contract
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -17,9 +18,41 @@ def main(argv: Optional[list[str]] = None) -> None:
         default=12,
         help="Keep only the last N dialog messages in memory.past_dialogs to reduce prompt truncation.",
     )
+    ap.add_argument(
+        "--motion_repeat",
+        type=int,
+        default=1,
+        help="Optional preprocessing: repeat APPROACH/ALIGN_YAW examples N times to reduce motion->INTERACT bias.",
+    )
+    ap.add_argument(
+        "--interact_keep_prob",
+        type=float,
+        default=1.0,
+        help="Optional preprocessing: keep probability for INTERACT examples (1.0 keeps all, <1.0 downsamples).",
+    )
+    ap.add_argument("--rebalance_seed", type=int, default=0)
     args = ap.parse_args(argv)
 
+    # Step 1: generator -> contract
     convert_generator_jsonl_to_contract(args.generator_jsonl, args.out_contract, max_past_dialogs=int(args.max_past_dialogs))
+
+    # Step 2 (optional): rebalance tool-call frequencies *as a preprocessing step*
+    if int(args.motion_repeat) != 1 or float(args.interact_keep_prob) != 1.0:
+        tmp_out = str(args.out_contract) + ".tmp_rebalanced"
+        stats = rebalance_contract(
+            in_path=str(args.out_contract),
+            out_path=tmp_out,
+            seed=int(args.rebalance_seed),
+            motion_repeat=int(args.motion_repeat),
+            interact_keep_prob=float(args.interact_keep_prob),
+        )
+        # Replace out_contract with the rebalanced version.
+        import os
+
+        os.replace(tmp_out, str(args.out_contract))
+        print(f"[prepare] rebalanced contract written to {args.out_contract} | stats={stats}")
+
+    # Step 3: contract -> chat
     convert_contract_to_qwen_chat_jsonl(args.out_contract, args.out_chat)
 
 

@@ -71,6 +71,21 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Only collect generator JSONL (do not produce contract/chat JSONL).",
     )
 
+    # Optional preprocessing (tool-call rebalance) applied during preparation.
+    ap.add_argument(
+        "--motion_repeat",
+        type=int,
+        default=5,
+        help="Repeat APPROACH/ALIGN_YAW examples N times in the produced contract JSONL (default: 1 = no rebalance).",
+    )
+    ap.add_argument(
+        "--interact_keep_prob",
+        type=float,
+        default=1.0,
+        help="Keep probability for INTERACT examples in the produced contract JSONL (default: 1.0 = keep all).",
+    )
+    ap.add_argument("--rebalance_seed", type=int, default=0)
+
     args = ap.parse_args(argv)
 
     if args.out_dir:
@@ -117,6 +132,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Keep the LLM preparation logic in llm.*; imported lazily so data_generator can be
     # used without pulling in training dependencies.
     from llm.data import convert_contract_to_qwen_chat_jsonl, convert_generator_jsonl_to_contract
+    from llm.rebalance_contract import rebalance_contract
 
     convert_generator_jsonl_to_contract(
         generator_path=generator_path,
@@ -124,6 +140,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         instruction=args.instruction,
         max_past_dialogs=12,
     )
+
+    if int(args.motion_repeat) != 1 or float(args.interact_keep_prob) != 1.0:
+        tmp_out = str(out_contract) + ".tmp_rebalanced"
+        stats = rebalance_contract(
+            in_path=str(out_contract),
+            out_path=tmp_out,
+            seed=int(args.rebalance_seed),
+            motion_repeat=int(args.motion_repeat),
+            interact_keep_prob=float(args.interact_keep_prob),
+        )
+        os.replace(tmp_out, str(out_contract))
+        print(f"[collect] rebalanced contract written to {out_contract} | stats={stats}")
+
     convert_contract_to_qwen_chat_jsonl(out_contract, out_chat)
 
 
