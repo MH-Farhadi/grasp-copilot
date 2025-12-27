@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from peft import get_peft_model, prepare_model_for_kbit_training  # type: ignore[import]
 
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_VALID_FRACTION = 0.05
 
 _NON_ALNUM = re.compile(r"[^a-zA-Z0-9]+")

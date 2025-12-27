@@ -103,12 +103,14 @@ python scripts/train_sft_lora.py --help
 ```bash
 conda activate talm
 python scripts/train_sft_lora.py \
-  --train_path llm_contract.jsonl \
-  --output_dir outputs/qwen_lora_smoke \
+  --train_path data/runs/005/llm_contract.jsonl \
+  --output_dir outputs/qwen_lora_smoke_005 \
   --max_steps 20 \
   --logging_steps 1 \
   --save_strategy no \
-  --disable_eval
+  --disable_eval \
+  --no-packing \
+  --max_grad_norm 1.0
 ```
 
 - **Typical training run (with eval, still memory-safe defaults)**
@@ -116,9 +118,12 @@ python scripts/train_sft_lora.py \
 ```bash
 conda activate talm
 python scripts/train_sft_lora.py \
-  --train_path llm_contract.jsonl \
-  --valid_path llm_contract.jsonl \
-  --output_dir outputs/qwen_lora
+  --train_path data/runs/005/llm_contract.jsonl \
+  --valid_path data/runs/005/llm_contract.jsonl \
+  --output_dir outputs/qwen_lora_005 \
+  --no-packing \
+  --optim paged_adamw_32bit \
+  --max_grad_norm 1.0
 ```
 
 - **If you hit CUDA OOM**
