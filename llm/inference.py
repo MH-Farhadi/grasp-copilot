@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from peft import PeftModel  # type: ignore[import]  # pragma: no cover
 
 from .utils import json_loads_strict, set_seed
+from .data import SYSTEM_PROMPT
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +27,7 @@ class InferenceConfig:
 
 def _build_messages(prompt: str) -> List[Dict[str, str]]:
     return [
-        {"role": "system", "content": "You are a helpful assistant. Output ONLY valid JSON."},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
 

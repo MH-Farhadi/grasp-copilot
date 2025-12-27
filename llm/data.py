@@ -7,7 +7,28 @@ from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence,
 from .utils import json_loads_strict
 
 
-SYSTEM_PROMPT = "You are a helpful assistant. Output ONLY valid JSON."
+SYSTEM_PROMPT = (
+    "You are a helpful assistant.\n"
+    "You MUST output ONLY valid JSON.\n"
+    "Your output MUST be exactly one JSON object with this schema:\n"
+    '  {"tool": "<TOOL>", "args": <ARGS>}\n'
+    "Where <TOOL> is one of: INTERACT, APPROACH, ALIGN_YAW.\n"
+    "If tool == INTERACT, args MUST be:\n"
+    '  {"kind":"QUESTION"|"SUGGESTION"|"CONFIRM","text":<string>,"choices":[...]} and choices length <= 5.\n'
+    "If tool == APPROACH or ALIGN_YAW, args MUST be:\n"
+    '  {"obj": <string>}.\n'
+    "Do not output any other keys, and do not output any extra text."
+    "\n\nPolicy hints (important):\n"
+    "- The input includes `memory.last_prompt` and `memory.past_dialogs`.\n"
+    "- If the user just answered a YES/NO confirmation (last_prompt.context.type == 'confirm'):\n"
+    "  - Use the confirmed `obj_id` and the current gripper pose vs that object's pose.\n"
+    "  - If gripper cell != object cell -> output APPROACH({obj}).\n"
+    "  - Else if gripper yaw != object yaw -> output ALIGN_YAW({obj}).\n"
+    "  - Else do NOT execute motion; ask an INTERACT confirmation question instead.\n"
+    "- If the last prompt was a candidate choice menu (last_prompt.context.type == 'candidate_choice') and the user picked an object,\n"
+    "  do NOT execute motion immediately; output an INTERACT confirmation (YES/NO) for the next action.\n"
+    "- Treat `memory.candidates` as the set of nearby/eligible objects; avoid referencing far objects as 'close'.\n"
+)
 
 
 @dataclass(frozen=True, slots=True)

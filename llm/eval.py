@@ -82,8 +82,7 @@ def _normalize_tool_call(obj: Dict[str, Any]) -> Dict[str, Any]:
     """
     tool = obj.get("tool")
     args = obj.get("args")
-    if isinstance(tool, str):
-        tool = tool.strip().upper()
+    tool_norm = tool.strip().upper() if isinstance(tool, str) else tool
     if tool == "INTERACT" and isinstance(args, dict):
         kind = args.get("kind", args.get("type"))
         if isinstance(kind, str):
@@ -98,9 +97,14 @@ def _normalize_tool_call(obj: Dict[str, Any]) -> Dict[str, Any]:
             choices = []
         choices = [str(c) for c in choices][:10]  # keep some for diagnostics; validator enforces <=5
         return {"tool": "INTERACT", "args": {"kind": kind, "text": text, "choices": choices}}
-    if tool in {"APPROACH", "ALIGN_YAW"} and isinstance(args, dict):
-        return {"tool": tool, "args": {"obj": args.get("obj")}}
+    if tool_norm in {"APPROACH", "ALIGN_YAW"} and isinstance(args, dict):
+        return {"tool": tool_norm, "args": {"obj": args.get("obj")}}
     # Unknown shape: return as-is; validator will catch it.
+    # But do at least normalize the `tool` string for consistent confusion matrices.
+    if isinstance(tool_norm, str) and tool_norm != tool:
+        out = dict(obj)
+        out["tool"] = tool_norm
+        return out
     return obj
 
 
