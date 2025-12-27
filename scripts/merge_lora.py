@@ -5,7 +5,7 @@ from llm.train import merge_lora
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="DEPRECATED: merge a LoRA adapter into a standalone model. New training runs write merged models directly.")
     ap.add_argument("--base_model_name", type=str, required=True)
     ap.add_argument("--adapter_dir", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)

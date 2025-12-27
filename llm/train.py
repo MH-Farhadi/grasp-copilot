@@ -29,7 +29,10 @@ class TrainArgs:
     model_name: str = DEFAULT_MODEL
     train_path: str = ""
     valid_path: Optional[str] = None
-    output_dir: str = "models/lora"
+    # Primary output: a merged standalone model directory (what you will use for inference/eval).
+    output_dir: str = "models/merged_model"
+    # Internal training artifact directory (LoRA adapter + trainer state/checkpoints).
+    adapter_dir: Optional[str] = None
     full_finetune: bool = False
     # NOTE: 2048 can OOM on ~16GB GPUs depending on model + eval settings.
     # 1024 is a safer default; you can still pass --max_seq_length 2048 explicitly.
@@ -68,6 +71,8 @@ class TrainArgs:
     resume_from_checkpoint: Optional[str] = None
     # Packing can hurt structured-output tasks by concatenating multiple dialogues into a single sample.
     packing: bool = False
+    # For LoRA/QLoRA, merge into a standalone model directory at the end.
+    merge_at_end: bool = True
 
 
 def _model_slug(model_name: str) -> str:
@@ -182,6 +187,8 @@ def _chat_to_text(tok, messages: List[Dict[str, str]]) -> str:
 def train_sft_lora(args: TrainArgs) -> None:
     set_seed(args.seed)
     ensure_dir(args.output_dir)
+    adapter_dir = str(args.adapter_dir or (str(args.output_dir) + "_adapter"))
+    ensure_dir(adapter_dir)
 
     # Validate contract early for fail-fast UX.
     data_lib.validate_dataset_contract_jsonl(args.train_path)
@@ -286,7 +293,8 @@ def train_sft_lora(args: TrainArgs) -> None:
     if bool(args.use_4bit) and args.optim == "adamw_torch":
         optim = "paged_adamw_32bit"
     targs_kwargs: Dict[str, Any] = dict(
-        output_dir=args.output_dir,
+        # IMPORTANT: Training artifacts go to adapter_dir; output_dir is reserved for the final merged model.
+        output_dir=adapter_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -386,9 +394,25 @@ def train_sft_lora(args: TrainArgs) -> None:
     else:
         trainer.train()
 
-    model.save_pretrained(args.output_dir)
-    tok.save_pretrained(args.output_dir)
+    # Save results:
+    # - Full fine-tune: `model` is already a standalone model.
+    # - LoRA/QLoRA: save adapter, then merge into a standalone model at args.output_dir.
+    if args.full_finetune:
+        model.save_pretrained(args.output_dir, safe_serialization=True)
+        tok.save_pretrained(args.output_dir)
+    else:
+        # Save adapter for potential debugging (even though primary artifact is merged model).
+        model.save_pretrained(adapter_dir)
+        tok.save_pretrained(adapter_dir)
+        if args.merge_at_end:
+            merge_lora(base_model_name=args.model_name, adapter_dir=adapter_dir, output_dir=args.output_dir)
+        else:
+            print("[train] WARNING: merge_at_end disabled; adapter saved but no merged model written.")
+
     save_run_config(os.path.join(args.output_dir, "run_config.json"), args)
+    # Also record where the adapter ended up (useful for debugging).
+    with open(os.path.join(args.output_dir, "adapter_dir.txt"), "w", encoding="utf-8") as f:
+        f.write(adapter_dir + "\n")
 
 
 def merge_lora(base_model_name: str, adapter_dir: str, output_dir: str) -> None:
@@ -447,9 +471,15 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Where to write outputs. If omitted, it is auto-derived from --train_path as either "
-            "models/<model>_lora_<run_id> (default LoRA) or models/<model>_ft_<run_id> (--full_finetune)."
+            "Where to write the final merged standalone model. If omitted, it is auto-derived from --train_path "
+            "as models/<model>_merged_<run_id> (default LoRA) or models/<model>_ft_<run_id> (--full_finetune)."
         ),
+    )
+    ap.add_argument(
+        "--adapter_dir",
+        type=str,
+        default=None,
+        help="Optional directory for training artifacts (LoRA adapter). Defaults to <output_dir>_adapter.",
     )
     ap.add_argument(
         "--full_finetune",
@@ -507,16 +537,7 @@ def main() -> None:
         "--merge_at_end",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=(
-            "If set, automatically merge the trained LoRA adapter into a standalone model at the end "
-            "of training (writes a full merged model directory). Disable with --no-merge_at_end."
-        ),
-    )
-    ap.add_argument(
-        "--merged_output_dir",
-        type=str,
-        default=None,
-        help="Where to write the merged standalone model (defaults to models/<model>_merged_<run_id>).",
+        help="Whether to write a merged standalone model at the end (recommended: yes).",
     )
     args = ap.parse_args()
 
@@ -529,9 +550,9 @@ def main() -> None:
         output_dir = (
             _default_output_dir_ft(model_name=args.model_name, train_path=args.train_path)
             if bool(args.full_finetune)
-            else _default_output_dir(model_name=args.model_name, train_path=args.train_path)
+            else _default_merged_output_dir(model_name=args.model_name, train_path=args.train_path)
         )
-        print(f"[train] output_dir: {output_dir}")
+        print(f"[train] output_dir (merged model): {output_dir}")
 
     train_sft_lora(
         TrainArgs(
@@ -539,6 +560,7 @@ def main() -> None:
             train_path=args.train_path,
             valid_path=args.valid_path,
             output_dir=output_dir,
+            adapter_dir=args.adapter_dir,
             full_finetune=bool(args.full_finetune),
             max_seq_length=args.max_seq_length,
             per_device_train_batch_size=args.per_device_train_batch_size,
@@ -569,20 +591,9 @@ def main() -> None:
             report_to=args.report_to,
             resume_from_checkpoint=args.resume_from_checkpoint,
             packing=bool(args.packing),
+            merge_at_end=bool(args.merge_at_end),
         )
     )
-
-    if bool(args.merge_at_end) and (not bool(args.full_finetune)):
-        merged_dir = str(args.merged_output_dir) if args.merged_output_dir else _default_merged_output_dir(model_name=args.model_name, train_path=args.train_path)
-        if args.merged_output_dir is None:
-            print(f"[train] merged_output_dir: {merged_dir}")
-        try:
-            merge_lora(base_model_name=args.model_name, adapter_dir=output_dir, output_dir=merged_dir)
-        except Exception as e:
-            # Fail-soft: training artifacts (adapter) are still usable even if merge fails.
-            print(f"[train] WARNING: merge_lora failed: {e}")
-    elif bool(args.merge_at_end) and bool(args.full_finetune):
-        print("[train] merge_at_end ignored for --full_finetune (no adapter to merge).")
 
 
 if __name__ == "__main__":

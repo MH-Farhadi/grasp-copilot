@@ -8,14 +8,14 @@ Minimal GUI playground to visually validate the grasp-copilot policy.
   - W/S: change z (HIGH/MID/LOW)
 - Click "Ask assistance" to query either:
   - the oracle policy (fast debug), or
-  - a HuggingFace model via llm.inference (your trained adapter/merged model).
+  - a HuggingFace model via llm.inference (your trained *merged* model).
 
 Run:
   conda activate talm
   python scripts/gui_assist_demo.py --backend oracle
 
   # HF backend (example; update paths as needed):
-  python scripts/gui_assist_demo.py --backend hf --model_name Qwen/Qwen2.5-7B-Instruct --adapter_path outputs/qwen_lora
+  python scripts/gui_assist_demo.py --backend hf --model_path outputs/qwen_merged_005
 """
 
 from __future__ import annotations
@@ -350,9 +350,11 @@ def _build_input(world: GridWorld, memory: Dict[str, Any]) -> Dict[str, Any]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=["oracle", "hf"], default="oracle")
-    ap.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    ap.add_argument("--adapter_path", type=str, default=None)
-    ap.add_argument("--merged_model_path", type=str, default=None)
+    ap.add_argument("--model_path", type=str, default=None, help="Path/HF id of a merged standalone model (HF backend).")
+    # Backward compatible aliases (deprecated).
+    ap.add_argument("--model_name", type=str, default=None, help="DEPRECATED: use --model_path")
+    ap.add_argument("--merged_model_path", type=str, default=None, help="DEPRECATED: use --model_path")
+    ap.add_argument("--adapter_path", type=str, default=None, help="DEPRECATED: adapters are no longer supported here; use merged models.")
     ap.add_argument("--use_4bit", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--top_p", type=float, default=0.9)
@@ -393,14 +395,18 @@ def main() -> None:
     if args.backend == "oracle":
         backend: AssistantBackend = OracleBackend()
     else:
+        model_path = args.model_path or args.merged_model_path or args.model_name
+        if not model_path:
+            model_path = "Qwen/Qwen2.5-7B-Instruct"
+            print("[gui] WARNING: defaulting to Qwen/Qwen2.5-7B-Instruct; pass --model_path for a merged model.")
+        if args.adapter_path:
+            raise SystemExit("adapter_path is deprecated and not supported. Please pass a merged model via --model_path.")
         if args.deterministic:
             # Force greedy decoding for stable debugging.
             args.temperature = 0.0
             args.top_p = 1.0
         cfg = InferenceConfig(
-            model_name=args.model_name,
-            adapter_path=args.adapter_path,
-            merged_model_path=args.merged_model_path,
+            model_path=str(model_path),
             use_4bit=args.use_4bit,
             temperature=args.temperature,
             top_p=args.top_p,

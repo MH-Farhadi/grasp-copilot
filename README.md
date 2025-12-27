@@ -69,7 +69,7 @@ HF backend (example):
 
 ```bash
 conda activate talm
-python scripts/gui_assist_demo.py --backend hf --model_name Qwen/Qwen2.5-7B-Instruct --adapter_path outputs/qwen_lora
+python scripts/gui_assist_demo.py --backend hf --model_path outputs/qwen_merged_005
 ```
 
 ## LLM fine-tuning + inference
@@ -80,7 +80,7 @@ All commands must activate the `talm` environment first:
 conda activate talm
 ```
 
-### Prepare LLM data (adapter over existing generator JSONL)
+### Prepare LLM data (for training a merged model)
 
 ```bash
 conda activate talm
@@ -104,7 +104,7 @@ python scripts/train_sft_lora.py --help
 conda activate talm
 python scripts/train_sft_lora.py \
   --train_path data/runs/005/llm_contract.jsonl \
-  --output_dir outputs/qwen_lora_smoke_005 \
+  --output_dir outputs/qwen_merged_smoke_005 \
   --max_steps 20 \
   --logging_steps 1 \
   --save_strategy no \
@@ -120,7 +120,7 @@ conda activate talm
 python scripts/train_sft_lora.py \
   --train_path data/runs/005/llm_contract.jsonl \
   --valid_path data/runs/005/llm_contract.jsonl \
-  --output_dir outputs/qwen_lora_005 \
+  --output_dir outputs/qwen_merged_005 \
   --no-packing \
   --optim paged_adamw_32bit \
   --max_grad_norm 1.0
@@ -136,7 +136,7 @@ python scripts/train_sft_lora.py \
 - **Data / I/O**
   - **`--train_path`**: Path to the *contract* JSONL used for training (see “Prepare LLM data”).
   - **`--valid_path`**: Optional contract JSONL used for evaluation (ignored if `--disable_eval`).
-  - **`--output_dir`**: Where the LoRA adapter is written via `save_pretrained()` at the end of training.
+  - **`--output_dir`**: Where the final **merged standalone model** is written at the end of training.
 
 - **Model / memory**
   - **`--model_name`**: Base HF model id (default: `Qwen/Qwen2.5-7B-Instruct`).
@@ -163,7 +163,7 @@ python scripts/train_sft_lora.py \
 
 - **Checkpointing / logging**
   - **`--save_strategy {no,steps,epoch}`**: Whether to save intermediate checkpoints.
-    - Recommended: `no` (final adapter is saved at the end anyway).
+    - Recommended: `no` (the final merged model is saved at the end anyway).
   - **`--save_steps`**: Steps between checkpoints (when `save_strategy=steps`).
   - **`--save_only_model`**: Save only model weights (avoids huge optimizer checkpoints).
   - **`--save_total_limit`**: Keep at most this many checkpoints.
@@ -173,14 +173,11 @@ python scripts/train_sft_lora.py \
 
 ### Merge LoRA (optional)
 
-```bash
-conda activate talm
-python scripts/merge_lora.py --base_model_name Qwen/Qwen2.5-7B-Instruct --adapter_dir outputs/qwen_lora --output_dir outputs/qwen_merged
-```
+Note: newer training runs already write a merged model directly (no manual merge step needed).
 
 ### Inference demo (JSON-only)
 
 ```bash
 conda activate talm
-python scripts/inference_demo.py --model_name Qwen/Qwen2.5-7B-Instruct --adapter_path outputs/qwen_lora --prompt 'Return {"tool_name":"INTERACT","arguments":{"type":"notify","text":"ok"}}'
+python scripts/inference_demo.py --model_path outputs/qwen_merged_005 --prompt 'Return {"tool_name":"INTERACT","arguments":{"type":"notify","text":"ok"}}'
 ```

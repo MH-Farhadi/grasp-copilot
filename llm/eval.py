@@ -120,10 +120,51 @@ class EvalMetrics:
     interact_n: int = 0
 
     interact_choices_len_ok: int = 0
+    # Breakdown by dialog/prompt context (e.g. candidate_choice, confirm, mode_select).
+    by_context: Dict[str, Dict[str, int]] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.tool_confusion is None:
             self.tool_confusion = {}
+        if self.by_context is None:
+            self.by_context = {}
+
+
+def _ctx_bucket(input_json_str: str) -> str:
+    """
+    Attempt to bucket an example by the last prompt context type.
+    This is useful to see *where* the policy fails (candidate_choice vs confirm vs mode_select, etc).
+    """
+    try:
+        inp = json_loads_strict(input_json_str)
+    except Exception:
+        return "invalid_input_json"
+    if not isinstance(inp, dict):
+        return "invalid_input_json"
+    mem = inp.get("memory")
+    if not isinstance(mem, dict):
+        return "no_memory"
+    last_prompt = mem.get("last_prompt")
+    if not isinstance(last_prompt, dict):
+        return "no_last_prompt"
+    ctx = last_prompt.get("context")
+    if not isinstance(ctx, dict):
+        return "no_context"
+    t = ctx.get("type")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    return "unknown"
+
+
+def _bump_ctx(m: EvalMetrics, ctx: str, key: str, inc: int = 1) -> None:
+    row = m.by_context.setdefault(ctx, {})
+    row[key] = int(row.get(key, 0)) + int(inc)
+
+
+def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
 def _bump_confusion(m: EvalMetrics, gt_tool: str, pred_tool: str) -> None:
@@ -134,9 +175,11 @@ def _bump_confusion(m: EvalMetrics, gt_tool: str, pred_tool: str) -> None:
 def main(argv: Optional[list[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="Evaluate model on contract JSONL with tool-level metrics.")
     ap.add_argument("--contract_jsonl", type=str, required=True, help="Path to dataset-contract JSONL (id/instruction/input/output).")
-    ap.add_argument("--model_name", type=str, required=True, help="HF model id or local path.")
-    ap.add_argument("--adapter_path", type=str, default=None)
-    ap.add_argument("--merged_model_path", type=str, default=None)
+    ap.add_argument("--model_path", type=str, required=False, default=None, help="Path/HF id of a merged standalone model.")
+    # Backward compatible aliases (deprecated).
+    ap.add_argument("--model_name", type=str, default=None, help="DEPRECATED: use --model_path")
+    ap.add_argument("--merged_model_path", type=str, default=None, help="DEPRECATED: use --model_path")
+    ap.add_argument("--adapter_path", type=str, default=None, help="DEPRECATED: adapters are no longer supported here; use merged models.")
     ap.add_argument("--use_4bit", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--max_examples", type=int, default=200, help="Max examples to evaluate (sampled).")
     ap.add_argument("--progress_every", type=int, default=25, help="Print progress every N examples.")
@@ -144,7 +187,16 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=1.0)
     ap.add_argument("--max_new_tokens", type=int, default=256)
+    ap.add_argument("--dump_mistakes_jsonl", type=str, default=None, help="If set, write per-example failures as JSONL.")
+    ap.add_argument("--max_mistakes", type=int, default=200, help="Cap number of mistake records written.")
+    ap.add_argument("--dump_all_jsonl", type=str, default=None, help="If set, write per-example records (including correct) as JSONL.")
     args = ap.parse_args(argv)
+
+    model_path = args.model_path or args.merged_model_path or args.model_name
+    if not model_path:
+        raise SystemExit("Pass a merged model via --model_path")
+    if args.adapter_path:
+        raise SystemExit("adapter_path is deprecated and not supported. Please pass a merged model via --model_path.")
 
     set_seed(int(args.seed))
     rng = random.Random(int(args.seed))
@@ -160,9 +212,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     from .inference import InferenceConfig, _build_messages, _generate_once, _load_model_and_tokenizer
 
     cfg = InferenceConfig(
-        model_name=str(args.model_name),
-        adapter_path=str(args.adapter_path) if args.adapter_path else None,
-        merged_model_path=str(args.merged_model_path) if args.merged_model_path else None,
+        model_path=str(model_path),
         use_4bit=bool(args.use_4bit),
         temperature=float(args.temperature),
         top_p=float(args.top_p),
@@ -175,19 +225,26 @@ def main(argv: Optional[list[str]] = None) -> None:
     print(f"[eval] model loaded in {time.time() - t0_load:.1f}s | evaluating {len(sample)} examples")
 
     m = EvalMetrics()
+    mistakes: List[Dict[str, Any]] = []
+    all_rows: List[Dict[str, Any]] = []
     t0 = time.time()
 
     for idx, r in enumerate(sample, start=1):
         m.n += 1
+        ex_id = str(r.get("id", "")).strip()
         instruction = str(r.get("instruction", "")).strip()
         input_str = str(r.get("input", "")).strip()
         gt_str = str(r.get("output", "")).strip()
+        ctx = _ctx_bucket(input_str)
+        _bump_ctx(m, ctx, "n", 1)
         # Ground truth tool call object (oracle).
         try:
             gt = json_loads_strict(gt_str)
         except Exception:
+            _bump_ctx(m, ctx, "gt_invalid_json", 1)
             continue
         if not isinstance(gt, dict):
+            _bump_ctx(m, ctx, "gt_not_object", 1)
             continue
 
         prompt = f"{instruction}\n\nInput:\n{input_str}"
@@ -196,42 +253,91 @@ def main(argv: Optional[list[str]] = None) -> None:
         pred_obj, err = _parse_model_json(raw)
         if pred_obj is None:
             _bump_confusion(m, str(gt.get("tool")), "INVALID_JSON")
+            _bump_ctx(m, ctx, "pred_invalid_json", 1)
+            if args.dump_mistakes_jsonl and len(mistakes) < int(args.max_mistakes):
+                mistakes.append(
+                    {
+                        "id": ex_id,
+                        "context": ctx,
+                        "prompt": prompt,
+                        "gt": gt,
+                        "pred": None,
+                        "raw": raw,
+                        "error": err,
+                    }
+                )
             continue
 
         m.json_valid += 1
+        _bump_ctx(m, ctx, "json_valid", 1)
         pred = _normalize_tool_call(pred_obj)
 
         # Schema validity (also enforces <=5 choices).
         try:
             validate_tool_call(pred)
             m.schema_valid += 1
+            _bump_ctx(m, ctx, "schema_valid", 1)
         except Exception:
             _bump_confusion(m, str(gt.get("tool")), "INVALID_SCHEMA")
+            _bump_ctx(m, ctx, "schema_invalid", 1)
 
         gt_tool = str(gt.get("tool"))
         pred_tool = str(pred.get("tool"))
         _bump_confusion(m, gt_tool, pred_tool)
         if gt_tool == pred_tool:
             m.tool_exact += 1
+            _bump_ctx(m, ctx, "tool_exact", 1)
+        else:
+            _bump_ctx(m, ctx, "tool_wrong", 1)
 
         # INTERACT kind + choice length metrics
         if gt_tool == "INTERACT":
             m.interact_n += 1
+            _bump_ctx(m, ctx, "interact_n", 1)
             gt_kind = str(((gt.get("args") or {}) if isinstance(gt.get("args"), dict) else {}).get("kind"))
             pred_kind = str(((pred.get("args") or {}) if isinstance(pred.get("args"), dict) else {}).get("kind"))
             if gt_kind == pred_kind:
                 m.interact_kind_exact += 1
+                _bump_ctx(m, ctx, "interact_kind_exact", 1)
             pred_choices = ((pred.get("args") or {}) if isinstance(pred.get("args"), dict) else {}).get("choices", [])
             if isinstance(pred_choices, list) and len(pred_choices) <= 5:
                 m.interact_choices_len_ok += 1
+                _bump_ctx(m, ctx, "interact_choices_len_ok", 1)
 
         # Motion obj exactness when both are motion tools.
         if gt_tool in {"APPROACH", "ALIGN_YAW"} and pred_tool in {"APPROACH", "ALIGN_YAW"}:
             m.motion_n += 1
+            _bump_ctx(m, ctx, "motion_n", 1)
             gt_obj = ((gt.get("args") or {}) if isinstance(gt.get("args"), dict) else {}).get("obj")
             pred_obj_id = ((pred.get("args") or {}) if isinstance(pred.get("args"), dict) else {}).get("obj")
             if gt_obj == pred_obj_id:
                 m.motion_obj_exact += 1
+                _bump_ctx(m, ctx, "motion_obj_exact", 1)
+
+        ok = bool(gt_tool == pred_tool)
+        if args.dump_all_jsonl is not None:
+            all_rows.append(
+                {
+                    "id": ex_id,
+                    "context": ctx,
+                    "gt": gt,
+                    "pred": pred,
+                    "raw": raw,
+                    "ok": ok,
+                }
+            )
+        if (not ok) and args.dump_mistakes_jsonl and len(mistakes) < int(args.max_mistakes):
+            mistakes.append(
+                {
+                    "id": ex_id,
+                    "context": ctx,
+                    "prompt": prompt,
+                    "gt": gt,
+                    "pred": pred,
+                    "raw": raw,
+                    "error": None,
+                }
+            )
 
         if int(args.progress_every) > 0 and (idx % int(args.progress_every) == 0 or idx == len(sample)):
             dt = max(1e-9, time.time() - t0)
@@ -253,8 +359,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         "interact_kind_exact_rate": rate(m.interact_kind_exact, m.interact_n),
         "interact_choices_len_ok_rate": rate(m.interact_choices_len_ok, m.interact_n),
         "tool_confusion": m.tool_confusion,
+        "by_context_counts": m.by_context,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
+
+    if args.dump_mistakes_jsonl:
+        _write_jsonl(str(args.dump_mistakes_jsonl), mistakes)
+        print(f"[eval] wrote mistakes: {args.dump_mistakes_jsonl} ({len(mistakes)})")
+    if args.dump_all_jsonl:
+        _write_jsonl(str(args.dump_all_jsonl), all_rows)
+        print(f"[eval] wrote all rows: {args.dump_all_jsonl} ({len(all_rows)})")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ def test_json_repair_logic_without_model(monkeypatch):
     monkeypatch.setattr(inf, "_load_model_and_tokenizer", fake_load)
     monkeypatch.setattr(inf, "_generate_once", fake_generate_once)
 
-    cfg = inf.InferenceConfig(model_name="dummy", adapter_path=None, merged_model_path=None)
+    cfg = inf.InferenceConfig(model_path="dummy")
     out = inf.generate_json_only("hi", cfg)
     assert out["tool_name"] == "INTERACT"
 
@@ -33,7 +33,7 @@ def test_json_repair_raises_after_second_failure(monkeypatch):
     monkeypatch.setattr(inf, "_load_model_and_tokenizer", fake_load)
     monkeypatch.setattr(inf, "_generate_once", fake_generate_once)
 
-    cfg = inf.InferenceConfig(model_name="dummy", adapter_path=None, merged_model_path=None)
+    cfg = inf.InferenceConfig(model_path="dummy")
     try:
         inf.generate_json_only("hi", cfg)
         assert False, "expected error"

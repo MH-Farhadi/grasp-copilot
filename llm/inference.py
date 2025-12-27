@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    # Optional dependency; imported at runtime only when adapter_path is provided.
+    # Optional dependency; not required for merged-model inference.
     from peft import PeftModel  # type: ignore[import]  # pragma: no cover
 
 from .utils import json_loads_strict, set_seed
@@ -14,9 +14,8 @@ from .utils import json_loads_strict, set_seed
 
 @dataclass(frozen=True, slots=True)
 class InferenceConfig:
-    model_name: str
-    adapter_path: Optional[str]
-    merged_model_path: Optional[str]
+    # Path (local dir or HF id) to a *merged* standalone model.
+    model_path: str
     use_4bit: bool = False
     temperature: float = 0.2
     top_p: float = 0.9
@@ -36,8 +35,7 @@ def _load_model_and_tokenizer(cfg: InferenceConfig):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    model_path = cfg.merged_model_path or cfg.model_name
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, fix_mistral_regex=True)
+    tok = AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True, fix_mistral_regex=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -61,7 +59,7 @@ def _load_model_and_tokenizer(cfg: InferenceConfig):
     # Some environments may not have `accelerate`, which is needed for device_map="auto".
     try:
         model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            cfg.model_path,
             trust_remote_code=True,
             dtype="auto",
             quantization_config=quant_cfg,
@@ -70,7 +68,7 @@ def _load_model_and_tokenizer(cfg: InferenceConfig):
     except Exception:
         # Fallback: load without device_map and move to CUDA if possible.
         model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            cfg.model_path,
             trust_remote_code=True,
             dtype="auto",
             quantization_config=quant_cfg,
@@ -78,11 +76,6 @@ def _load_model_and_tokenizer(cfg: InferenceConfig):
         if torch.cuda.is_available():
             # Some transformer stubs confuse type checkers on `.to("cuda")`; cast to Any.
             model = cast(Any, model).to("cuda")
-
-    if cfg.adapter_path:
-        from peft import PeftModel  # type: ignore[import]
-
-        model = PeftModel.from_pretrained(model, cfg.adapter_path)
 
     model.eval()
     return model, tok
@@ -141,9 +134,11 @@ def generate_json_only(prompt: str, cfg: InferenceConfig) -> Dict[str, Any]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    ap.add_argument("--adapter_path", type=str, default=None)
-    ap.add_argument("--merged_model_path", type=str, default=None)
+    ap.add_argument("--model_path", type=str, required=False, default=None, help="Path/HF id of a merged standalone model.")
+    # Backward compatible aliases (deprecated).
+    ap.add_argument("--model_name", type=str, default=None, help="DEPRECATED: use --model_path")
+    ap.add_argument("--merged_model_path", type=str, default=None, help="DEPRECATED: use --model_path")
+    ap.add_argument("--adapter_path", type=str, default=None, help="DEPRECATED: adapters are no longer supported here; use merged models.")
     ap.add_argument("--use_4bit", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--prompt", type=str, default=None)
     ap.add_argument("--prompt_file", type=str, default=None)
@@ -158,6 +153,14 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    # Resolve model path (merged models only).
+    model_path = args.model_path or args.merged_model_path or args.model_name
+    if not model_path:
+        model_path = "Qwen/Qwen2.5-7B-Instruct"
+        print("[inference] WARNING: defaulting to Qwen/Qwen2.5-7B-Instruct; pass --model_path for a merged model.")
+    if args.adapter_path:
+        raise SystemExit("adapter_path is deprecated and not supported. Please pass a merged model via --model_path.")
+
     if (args.prompt is None) == (args.prompt_file is None):
         raise SystemExit("Provide exactly one of --prompt or --prompt_file")
     prompt = args.prompt
@@ -165,9 +168,7 @@ def main() -> None:
         prompt = open(args.prompt_file, "r", encoding="utf-8").read()
 
     cfg = InferenceConfig(
-        model_name=args.model_name,
-        adapter_path=args.adapter_path,
-        merged_model_path=args.merged_model_path,
+        model_path=str(model_path),
         use_4bit=args.use_4bit,
         temperature=args.temperature,
         top_p=args.top_p,
