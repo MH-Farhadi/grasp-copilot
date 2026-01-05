@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grasp-copilot"
+version = "0.1.0"
+description = "A copilot LLM for suggesting grasp assistives."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.23",
+  "transformers>=4.40",
+  "datasets>=2.16",
+  "accelerate>=0.28",
+  "peft>=0.10",
+  "trl>=0.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
+qlora = [
+  # Only required for --use_4bit (QLoRA / 4-bit inference).
+  "bitsandbytes>=0.43; platform_system=='Linux'",
+]
+
+[project.scripts]
+grasp-collect = "data_generator.collect_and_prepare:main"
+grasp-train = "llm.train:main"
+grasp-eval = "llm.eval:main"
+grasp-infer = "llm.inference:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+

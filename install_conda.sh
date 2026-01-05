@@ -118,7 +118,8 @@ else
   echo "Skipping separate PyTorch install"
 fi
 
-echo "Installing python requirements via pip"
+echo "Installing grasp-copilot (editable) + python requirements via pip"
+conda run -n "$ENV_NAME" python -m pip install -e "$ROOT_DIR" >/dev/null
 conda run -n "$ENV_NAME" python -m pip install -r "$REQ_FILE" >/dev/null
 
 echo ""

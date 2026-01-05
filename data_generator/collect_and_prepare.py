@@ -82,7 +82,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap.add_argument(
         "--motion_repeat",
         type=int,
-        default=5,
+        default=1,
         help="Repeat APPROACH/ALIGN_YAW examples N times in the produced contract JSONL (default: 1 = no rebalance).",
     )
     ap.add_argument(
@@ -91,9 +91,22 @@ def main(argv: Optional[list[str]] = None) -> None:
         default=1.0,
         help="Keep probability for INTERACT examples in the produced contract JSONL (default: 1.0 = keep all).",
     )
+    ap.add_argument(
+        "--rebalance",
+        action="store_true",
+        help=(
+            "Convenience flag to enable rebalancing with a reasonable default. "
+            "If set (and --motion_repeat/--interact_keep_prob are left at defaults), this uses motion_repeat=10."
+        ),
+    )
     ap.add_argument("--rebalance_seed", type=int, default=0)
 
     args = ap.parse_args(argv)
+
+    # Convenience: if the user asked to rebalance but didn't specify custom knobs,
+    # apply a reasonable default that emphasizes motion tools.
+    if bool(args.rebalance) and int(args.motion_repeat) == 1 and float(args.interact_keep_prob) == 1.0:
+        args.motion_repeat = 2
 
     if args.out_dir:
         out_dir_path = Path(str(args.out_dir))

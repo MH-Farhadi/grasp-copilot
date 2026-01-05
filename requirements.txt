@@ -12,7 +12,6 @@
 numpy>=1.23
 
 # LLM (training + inference)
-torch>=2.1
 transformers>=4.40
 datasets>=2.16
 accelerate>=0.28
