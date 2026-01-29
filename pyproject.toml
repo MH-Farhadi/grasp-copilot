@@ -11,6 +11,11 @@ requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.23",
   "transformers>=4.40",
+  # Some environments (esp. minimal/conda) may not include these optional deps,
+  # but tokenizers are required for most modern LLMs and protobuf is needed by
+  # parts of transformers' tokenizer fallback machinery.
+  "tokenizers>=0.15",
+  "protobuf>=4.21",
   "datasets>=2.16",
   "accelerate>=0.28",
   "peft>=0.10",

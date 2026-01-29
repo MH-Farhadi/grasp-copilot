@@ -145,7 +145,11 @@ def _load_model_and_tokenizer(args: TrainArgs):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, fix_mistral_regex=True)
+    # Be tolerant to older transformers versions that may not accept `fix_mistral_regex`.
+    try:
+        tok = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, use_fast=True, fix_mistral_regex=True)
+    except TypeError:
+        tok = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -420,7 +424,10 @@ def merge_lora(base_model_name: str, adapter_dir: str, output_dir: str) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel  # type: ignore[import]
 
-    tok = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True, fix_mistral_regex=True)
+    try:
+        tok = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True, use_fast=True, fix_mistral_regex=True)
+    except TypeError:
+        tok = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 

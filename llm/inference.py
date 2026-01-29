@@ -72,7 +72,21 @@ def _load_model_and_tokenizer(cfg: InferenceConfig):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_path = _resolve_model_path(cfg.model_path)
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, fix_mistral_regex=True)
+    # Tokenizer loading can fail in minimal environments (missing optional deps like `tokenizers`/`protobuf`)
+    # or when passing non-standard kwargs. Be conservative and provide a helpful error.
+    try:
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=True, fix_mistral_regex=True)
+    except TypeError:
+        # Older transformers may not accept `fix_mistral_regex`.
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=True)
+    except Exception as e:
+        msg = (
+            f"Failed to load tokenizer from '{model_path}'.\n"
+            f"- Ensure the model directory contains tokenizer files (e.g., tokenizer.json or vocab.json+merges.txt).\n"
+            f"- Ensure optional deps are installed: `pip install tokenizers protobuf`.\n"
+            f"Original error: {type(e).__name__}: {e}"
+        )
+        raise RuntimeError(msg) from e
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
