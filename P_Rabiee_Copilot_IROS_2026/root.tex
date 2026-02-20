@@ -1,0 +1,265 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%2345678901234567890123456789012345678901234567890123456789012345678901234567890
+%        1         2         3         4         5         6         7         8
+
+\documentclass[conference]{IEEEtran}  % Comment this line out if you need a4paper
+
+%\documentclass[a4paper, 10pt, conference]{ieeeconf}      % Use this line for a4 paper
+
+\IEEEoverridecommandlockouts                              % This command is only needed if 
+                                                          % you want to use the \thanks command
+
+                                     % Needed to meet printer requirements.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{caption}
+\usepackage{comment}
+% \captionsetup[figure]{skip=1pt}  
+\setlength{\textfloatsep}{3pt}
+\setlength{\abovecaptionskip}{4pt} 
+\setlength{\belowcaptionskip}{4pt} 
+
+\setlength{\floatsep}{3pt} 
+\setlength{\intextsep}{3pt}  
+%In case you encounter the following error:
+%Error 1010 The PDF file may be corrupt (unable to open PDF file) OR
+%Error 1000 An error occurred while parsing a contents stream. Unable to analyze the PDF file.
+%This is a known problem with pdfLaTeX conversion filter. The file cannot be opened with acrobat reader
+%Please use one of the alternatives below to circumvent this error by uncommenting one or the other
+%\pdfobjcompresslevel=0
+%\pdfminorversion=4
+
+% See the \addtolength command later in the file to balance the column lengths
+% on the last page of the document
+
+% The following packages can be found on http:\\www.ctan.org
+%\usepackage{graphics} % for pdf, bitmapped graphics files
+%\usepackage{epsfig} % for postscript graphics files
+%\usepackage{mathptmx} % assumes new font selection scheme installed
+%\usepackage{times} % assumes new font selection scheme installed
+%\usepackage{amsmath} % assumes amsmath package installed
+%\usepackage{amssymb}  % assumes amsmath package installed
+
+\title{\LARGE \bf
+ PRIME: A Closed-Loop LLM-Based Cobot for Dynamic Human-Robot Autonomy Allocation and Teaming}
+
+\author{Ali Rabiee$^{1}$, MH Farhadi$^{1}$, Shayan Khodabakhsh$^{1}$, Resit Sendag$^{1}$, Reza Abiri$^{1}$
+\thanks{*This work was supported by RI-INBRE (NIH P20GM103430) \& NSF award ID 2245558.}
+\thanks{**Code: \tt\small \href{https://github.com/AbiriLab/STREAMS}{https://github.com/AbiriLab/STREAMS}}
+\thanks{$^{1}$Ali Rabiee, MH Farhadi, Sima Ghafoori, Shayan Khodabakhsh, Resit Sendag, and Reza Abiri (corresponding author) are with the Department of Electrical Engineering, University of Rhode Island, Kingston, RI, USA, 02881.
+        {\tt\small emails: \{ali.rabiee, mh.farhadi, sima.ghafoori, skhodabakhsh, sendag, reza\_abiri\}@uri.edu}}%
+}
+
+% \author{\IEEEauthorblockN{1\textsuperscript{st} Ali Rabiee}
+% \IEEEauthorblockA{\textit{Dept. of Electrical Engineering} \\
+% \textit{University of Rhode Island}\\
+% Kingston, RI, USA \\
+% ali.rabiee@uri.edu}
+% ~\\
+% \and
+% \IEEEauthorblockN{2\textsuperscript{nd} MH Farhadi}
+% \IEEEauthorblockA{\textit{Dept. of Electrical Engineering} \\
+% \textit{University of Rhode Island}\\
+% Kingston, RI, USA \\
+% mh.farhadi@uri.edu}
+
+% ~\\
+% \and
+% \IEEEauthorblockN{3\textsuperscript{rd} Shayan Khodabakhsh}
+% \IEEEauthorblockA{\textit{Dept. of Electrical Engineering} \\
+% \textit{University of Rhode Island}\\
+% Kingston, RI, USA \\
+% skhodabakhsh@uri.edu}
+
+% ~\\
+% \and
+% \IEEEauthorblockN{4\textsuperscript{th} Reza Abiri}
+% \IEEEauthorblockA{\textit{Dept. of Electrical Engineering} \\
+% \textit{University of Rhode Island}\\
+% Kingston, RI, USA \\
+% reza\_abiri@uri.edu}
+% *Corresponding author
+% }
+\begin{document}
+
+\maketitle
+% \thispagestyle{empty}
+% \pagestyle{empty}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+We present a deliberative interaction layer that infers user intent from motion trends and task context, deciding when to act autonomously and when to query the user through a small set of discrete choices.
+\end{abstract}
+\begin{IEEEkeywords}
+Shared autonomy, biosignal-based control, multimodal interfaces, self-learning algorithms.
+\end{IEEEkeywords}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{INTRODUCTION}
+
+Shared autonomy (SA) enables humans and robots to collaboratively perform tasks by blending user control with autonomous robotic assistance \cite{farhadi2026human, abiri2024toward}. In assistive robotic arms, this paradigm empowers users with motor impairments to operate robotic manipulators more effectively by augmenting their limited control signals with intelligent autonomy \cite{rabiee2025learning, rabiee2025streams}. Such control signals range from low-bandwidth non-invasive modalities like joysticks \cite{brooks2012design}, head arrays \cite{jackowski2017head}, body-machine interfaces \cite{rizzoglio2023non, lee2024learning}, eye-tracking systems \cite{wohle2021towards, admoni2016predicting}, electroencephalogram (EEG) \cite{rabiee2024wavelet, rabiee2025comparative, ghafoori2024bispectrum, cetera2024classification, cetera2025macroscopic}, and electromyography (EMG) sensors \cite{teramae2017emg}, to high-bandwidth invasive solutions like cortical implants \cite{ehrlich2022adaptive}. However, several challenges remain in such high-dimensional demanding interactions, contributing to the abandonment of robotic arms by end users. First, inferring a user’s intent from these modalities, particularly when only noisy, low-dimensional, non-invasive signals are available, is inherently challenging for high-dimensional robotic systems operating in a workspace with multiple potential goals.   \cite{rabiee2025learning}. Second, intent inference techniques often depend heavily on specific control modality interfaces, which are typically developed under narrow assumptions about a user’s capability spectrum, such as the presence of head motion for head arrays or eye-gaze movement for eye trackers. Many of these modalities can be cognitively and physically demanding, depending on task complexity, environmental conditions, and the user’s fatigue or state. Third, such open-loop and non-interactive inference systems are commonly designed with rigid human–robot autonomy allocation, without accounting for variability in disability spectrum, evolving fatigue during task execution, or changing contextual demands. In complex environments, greater robotic autonomy may be desired and necessary, whereas in simpler settings, users may prefer full control to preserve precision and agency.
+
+
+\begin{comment}
+Do you want to use the materials from this paragraph? let's chat.  
+
+There are several central challenges in shared autonomy lies in  The robot must predict which goal the user is pursuing among multiple possibilities and assist accordingly. Prior approaches to intent inference typically rely on probabilistic models and predefined goal sets \cite{dragan2013policy, javdani2018shared}. Shared autonomy has often been formalized as a Partially Observable Markov Decision Process (POMDP), where the user’s goal is treated as a latent variable, and the system maintains a belief distribution over candidate goals while selecting assistive actions to minimize task cost \cite{nikolaidis2017human}. While effective in structured settings, these methods typically operate in an open-loop condition under the assumption of a closed and known goal space, which limits their applicability in realistic environments that may require closed-loop feedback communication with the user and potentially dynamic goals generated on the fly.  
+
+\end{comment}
+
+% Ali, do you want to expand one or two sentences, then talk about disadvaltage? 
+As a recent innovation, large language models (LLMs) have been proposed as flexible high- and low-level planners capable of decomposing user-provided natural language instructions into actionable robotic behaviors \cite{jin2024robotgpt, parakh2024lifelong}. Leveraging their extensive world knowledge, LLMs can generate semantically meaningful plans or invoke abstract skills to control a robotic arm \cite{singh2022progprompt, huang2023voxposer}. However, although these interfaces have the potential to support dynamic human–robot autonomy allocation, they require high-bandwidth natural language input, spoken or typed, as well as the user’s ability to engage in sequential, often time-consuming, open-loop dialogue. These assumptions substantially limit their applicability in high-dimensional assistive contexts, where users may lack reliable verbal or textual communication abilities to convey commands, particularly low-level ones. In practice, individuals with severe impairments frequently rely on highly constrained input modalities, such as binary yes/no switches or simple multi-choice selectors, while expecting meaningful interactive feedback and execution from intelligent layers within the robotic system. Moreover, overt language-based interaction may be impractical in public environments due to noise, or even in home settings due to privacy concerns.
+
+
+\begin{figure}[ht!] %!t
+\centering
+\includegraphics[width=3.6in]{figs/fig1_DIM.jpeg}
+\caption{PRIME architecture overview.}
+\label{DIM_intro}
+\end{figure}
+
+Our research bridges the gap between traditional shared-autonomy frameworks with rigid human–robot autonomy allocation and context-aware LLM-based planners to establish a dynamic human–robot teaming framework for controlling a high-dimensional assistive robotic arm in a complex workspace with limited user input. We introduce PRIME (Planning and Reasoning with Interactive Minimal-input Memory-Enhanced Executive), a closed-loop collaborative robotic system that leverages an LLM as its core reasoning engine without relying on high-bandwidth natural language input. PRIME enables fluent and adaptive human–robot teaming with dynamically adjustable autonomy allocation, using only symbolic observations and minimal user interaction within a closed-loop feedback structure. The system represents a complex workspace environment through symbolic abstractions of object identities and locations, together with a temporal history of the robot’s actions (e.g., gripper pose sequences). The core LLM continuously reasons over this information to infer user intent and prepare for instant, dynamic autonomy adjustment while determining the next action through a hierarchical and informative decision structure. Critically, upon receiving a query, PRIME can engage in closed-loop interaction to immediately resolve ambiguity while simultaneously executing the necessary symbolic actions as part of shared autonomy; alternatively, the user can override the system at any time and at any level of execution to withhold assistance. For example, if a user’s partial trajectory reflects ambiguity between two objects, the LLM can generate a disambiguating question (e.g., “Are you trying to pick up the mug?”). If intent confidence is sufficiently high, it may directly trigger symbolic actions such as $<$APPROACH: mug$>$ or $<$ALIGN: mug$>$. By reasoning over temporal behavioral patterns, PRIME interprets subtle motion cues such as hesitation or repeated attempts near an object as meaningful indicators of intent, all while maintaining minimal interaction burden. Conversely, during execution, if the user prefers to regain partial or full control, PRIME can step back from providing guidance or autonomous actions, allowing the user to engage as desired and command the robot. An overview of the PRIME system architecture is shown in Fig. \ref{DIM_intro}.
+
+Our contributions can be summarized as:
+
+\begin{itemize}
+    \item Closed-Loop LLM Reasoning from Symbolic Observations: We present a modular architecture in which an LLM functions as the central planner, reasoning over symbolic representations of object poses, gripper trajectories, and interaction history. This enables open-ended goal inference and action planning without requiring a fixed goal library.
+    \item Minimal Interface for Intent Disambiguation: We demonstrate that natural and effective shared autonomy is achievable using only low-bandwidth user inputs. The LLM autonomously decides when and how to query the user through binary or multiple-choice prompts, reducing cognitive and physical load for users with severe communication constraints.
+    \item Integration of Shared Autonomy and LLM Planning: Our system synthesizes the robustness of shared autonomy with the flexible reasoning capabilities of LLMs. By operating at the symbolic level, the LLM plans context-aware assistance strategies, determines confidence thresholds, and coordinates tool invocation. This hybrid design enables robust grasping assistance in scenarios where neither traditional shared control nor LLM-driven language-based systems alone would suffice.
+\end{itemize}
+
+% =======================================================
+% # II. Related Works #
+% =======================================================
+\section{Related work}
+
+\subsection{Intent Inference in Shared Autonomy}
+Shared autonomy systems traditionally operate in an open-loop form under the assumption that the user’s desired goal is known or can be selected from a finite set \cite{javdani2015shared, yow2023shared}. Many early frameworks explicitly encode this assumption through goal-conditioned Markov Decision Processes (MDPs), where each candidate goal is associated with a separate policy or reward function \cite{dragan2013policy}. Under this formulation, the robot must infer which goal the human intends to achieve and then execute the corresponding assistive policy. While this approach enables formal planning and optimality guarantees, it relies on having an enumerated set of discrete goals and accurate models for each condition, which is rarely met in realistic, open-ended assistive settings.
+
+To handle the uncertainty in user intent more flexibly, a large body of subsequent work has focused on goal inference from human behavior. A common approach models the human as approximately rational and uses probabilistic inference to estimate their intended goal from observed control inputs. For instance, maximum entropy inverse optimal control \cite{ziebart2009planning} infers a distribution over goals by evaluating how closely user actions align with optimal behavior for each goal. Bayesian filtering techniques \cite{jain2015assistive} update goal beliefs over time based on joystick trajectories, eye gaze, or head movements. A more general and expressive formulation is the Partially Observable Markov Decision Process (POMDP) framework, where the user’s goal is treated as a latent variable in the belief state. Prior works \cite{nikolaidis2017human, javdani2018shared} formalize shared autonomy as a POMDP, enabling the robot to plan information-seeking and assistive actions simultaneously. In practice, many of these systems implement a predict-then-assist strategy \cite{herlant2016assistive} wherein the robot gradually increases the level of assistance once its confidence in a specific goal surpasses a threshold.
+
+While these methods have demonstrated effectiveness in structured domains with known objects, they are constrained by the need for hand-engineered goal spaces and predefined reward models. They often struggle when user intent shifts during a task, when novel objects appear, or when behavior is ambiguous. This brittleness makes them less suitable for real-world assistive applications, where flexibility and adaptability are critical.
+
+\subsection{LLM-Based Robotic Planning}
+The emergence of Large Language Models (LLMs) has introduced new possibilities for high-level robot planning and control. In the SayCan framework \cite{ahn2022can}, an LLM proposes natural language actions in response to a user instruction, and a value function grounded in the robot’s environment estimates the feasibility of each action. This combination allows the system to translate abstract instructions like “bring me a Coke” into actionable primitives aligned with physical constraints. Building on this, the Inner Monologue paradigm \cite{huang2022inner} incorporates real-time feedback into the control loop. The LLM is prompted with observations and prior actions and is allowed to replan or ask clarification questions when the task state changes or an action fails. In Code-as-Policies \cite{liang2022code}, the LLM generates executable Python-like code, calling predefined robot APIs such as move\_to(obj) or check\_grasp\_success(), enabling conditional logic, loops, and reactive plans.
+
+Despite their expressiveness, these systems are fundamentally designed for settings with high-bandwidth natural language interfaces. The user is expected to provide detailed task instructions and often to participate in dialogue throughout task execution. This reliance on verbal input renders these frameworks unsuitable for users with speech or text limitations, which is common in assistive contexts. Without such input, these LLMs lack explicit goals to plan around, reducing their usefulness in constrained-interaction scenarios.
+
+\subsection{Low-Bandwidth Interaction and Temporal Reasoning}
+To reduce reliance on speech and high-bandwidth interfaces, recent research has explored low-effort communication channels such as gestures, short utterances, and incremental corrections. A prominent example is GIRAF \cite{lin2023gesture}, which integrates gesture recognition with LLM-based reasoning. The system interprets deictic gestures, such as pointing or nudging, using computer vision models, then leverages an LLM to infer intent based on the spatial context. For instance, pointing at a cup could be interpreted as “pick up” or “pour into,” depending on nearby objects and previous task history. This approach avoids rigid gesture-command mappings and improves generalization to novel scenarios. Other works focus on enabling users to refine robot actions incrementally during execution. ExTraCT \cite{yow2024extract} allows users to issue corrective instructions like “move a bit to the left,” which are mapped by an LLM to predefined trajectory modifications. This separation of language interpretation and motion control enables the reuse of corrections across tasks and environments. Similarly, Rajapakshe et al. \cite{rajapakshe2024synergizing} present a voice-based shared autonomy system that interprets sequences of short verbal commands (e.g., “go higher... now left”), using temporal context to disambiguate underspecified phrases like “a little more.”
+
+While these systems showcase the power of combining contextual reasoning with low-bandwidth inputs, they all assume at least some form of verbal communication from the user. This limits their applicability in severely assistive settings where speech or text input is unavailable. Furthermore, they often lack structured fallback mechanisms when input signals—gestural or verbal—are ambiguous or missing. In contrast, our framework introduces a closed-loop interaction model where the LLM reasons over temporally ordered behavioral history and system memory to infer user intent. Rather than requiring natural language or gestures, the LLM autonomously formulates clarifying queries with structured, low-effort responses—such as binary selections or multiple-choice options. This design enables effective intent disambiguation and real-time assistance in settings with high communication constraints, while preserving contextual awareness and adaptability across tasks.
+
+% =======================================================
+% # III. Methods #
+% =======================================================
+\section{Methods}
+
+\subsection{System Overview and Assumptions}
+\label{sec:system_overview}
+
+PRIME is an LLM-based executive for shared-autonomy tabletop grasping under low-bandwidth user input. The user teleoperates a Kinova Jaco2 arm with a standard joystick and answers PRIME’s queries via a small set of discrete buttons (e.g., \textit{Yes/No} or up to five options). At each timestep, PRIME receives (i) a compact symbolic description of the robot--scene state and (ii) an explicit memory of recent interactions and candidate objects. Based on this input, the LLM outputs exactly one structured decision: either an \texttt{INTERACT} action (ask a short question, make a suggestion, or request confirmation) or a high-level manipulation tool call such as \texttt{APPROACH(obj)} or \texttt{ALIGN\_YAW(obj)}.
+
+Figure~\ref{fig:architecture} illustrates the end-to-end loop. When PRIME selects an action tool, execution is delegated to an off-the-shelf motion planning and control stack. The executor returns a compact outcome signal (success/failure and a coarse failure category), which is appended to PRIME’s next-step state and memory. This separation ensures the LLM remains a high-level decision maker, while low-level safety, feasibility, and trajectory generation are handled by established planners.
+
+The user operates the robot in one of three control modes: \emph{translation} (Cartesian end-effector motion), \emph{rotation} (gripper yaw adjustment), and \emph{gripper} (open/close). PRIME monitors the symbolic state and short recent control history to detect ambiguity and decide whether clarification is needed. Rather than estimating a probabilistic belief over user intent, PRIME maintains an explicit \emph{candidate set} of plausible target objects. If multiple candidates remain, PRIME asks a short multiple-choice query to prune the set. Once a single candidate remains, PRIME requests explicit confirmation before issuing any autonomous tool call.
+
+\begin{figure*}[ht!]
+\centering
+\includegraphics[width=7.5in]{figs/fig2.jpeg}
+\caption{System architecture of PRIME.}
+\label{fig:architecture}
+\end{figure*}
+
+\subsection{State Representation}
+\label{sec:state_representation}
+
+PRIME operates on a compact symbolic representation of the robot--scene state derived from a top-down view of the workspace. The workspace is discretized into a fixed $3 \times 3$ grid $\mathcal{G}=\{g_{ij}\}$ to provide a low-dimensional abstraction that is stable across simulation and hardware. Each object $o_k \in \mathcal{O}$ is represented as
+\[
+o_k = (id_k,\, \ell_k,\, g_k,\, \theta_k,\, h_k),
+\]
+where $id_k$ is an identifier, $\ell_k$ is a semantic label, $g_k \in \mathcal{G}$ denotes the grid cell occupied by the object, $\theta_k$ is its yaw orientation, and $h_k$ indicates whether the object is currently held.
+
+The gripper state at timestep $t$ is represented as
+\[
+r_t = (g^r_t,\, \theta^r_t,\, z^r_t),
+\]
+where $g^r_t \in \mathcal{G}$ denotes the gripper’s grid cell, $\theta^r_t$ its yaw orientation, and $z^r_t$ its vertical height. To capture coarse motion intent, PRIME maintains a short history of gripper states,
+\[
+\mathcal{H}_t = \{r_{t-T+1}, \dots, r_t\},
+\]
+which encodes recent movement trends without requiring precise trajectory tracking.
+
+The symbolic state also includes the user’s current control mode,
+\[
+m_t \in \{\text{translation},\,\text{rotation},\,\text{gripper}\},
+\]
+which constrains subsequent interaction and action decisions. The complete symbolic state provided to the LLM at timestep $t$ is thus
+\[
+s_t = (\mathcal{O},\, \mathcal{H}_t,\, m_t).
+\]
+
+\subsection{Memory-Based Interactive Reasoning}
+\label{sec:memory_reasoning}
+
+PRIME maintains an explicit, structured memory to support multi-step interactive reasoning across timesteps. Rather than encoding ambiguity through latent intent variables or probabilistic beliefs, PRIME represents uncertainty explicitly through memory elements that track past interactions, candidate objects, and recent decisions. This design enables ambiguity to be resolved deterministically through minimal user interaction. At each timestep, PRIME’s memory consists of the following components: (i) an ordered history of past dialog turns, (ii) the current set of candidate objects, (iii) the most recent interaction prompt issued by the system, and (iv) a short record of recent tool calls and actions. Each dialog turn stores the system’s prompt, the discrete response options presented to the user (if any), and the user’s selected response. This interaction history allows the LLM to reason over what has already been asked, how the user responded, and which ambiguities remain unresolved.
+
+The candidate set is stored explicitly in memory as a list of object identifiers corresponding to objects that remain plausible targets of the user’s intent. Candidate sets are initialized in memory using geometric cues derived from the symbolic state. This initialization reflects the assumption that the user can perform coarse, high-level motion toward an intended object (e.g., moving the gripper into the correct region of the workspace), but may not be able to precisely align the gripper or disambiguate among nearby objects. Accordingly, initial candidates include objects that are spatially close to the gripper or lie along the recent direction of motion,
+\[
+\mathcal{C}_t = \{\, o_k \in \mathcal{O} \mid g_k \in \mathcal{N}(g^r_t)\ \lor\ g_k \in \mathcal{D}(\mathcal{H}_t) \,\},
+\]
+where $\mathcal{N}(\cdot)$ returns the current grid cell and its neighbors, and $\mathcal{D}(\mathcal{H}_t)$ returns grid cells consistent with recent gripper motion. Importantly, once initialized, the candidate set is treated as a memory-level hypothesis that is refined over time through interaction. When multiple candidates remain, PRIME issues short multiple-choice clarification prompts to the user. User responses deterministically prune the candidate set by removing objects inconsistent with the selected answer. 
+
+PRIME also records the most recent interaction prompt, including its type (e.g., question, suggestion, or confirmation), its textual content, and the discrete options presented. This enables the LLM to avoid redundant queries and to condition subsequent decisions on the context of the most recent interaction. In addition, PRIME tracks recent tool calls, distinguishing between interaction actions and physical action tools, as well as the most recent executed action when applicable. When the candidate set is reduced to a single object, PRIME issues an explicit confirmation interaction before triggering any autonomous action. This confirmation gate ensures that physical execution is always grounded in user approval, even after ambiguity has been algorithmically resolved. After an action tool is executed, the motion planning stack returns a compact execution outcome (success or failure with a coarse error category). This feedback is appended to memory and conditions the next decision, allowing PRIME to adapt its behavior by re-querying the user, selecting a different assistance strategy, or deferring control.
+\begin{figure*}[ht!]
+\centering
+\includegraphics[width=6.5in]{figs/fig3_DIM_USER_exp.jpeg}
+\caption{Example interaction sequence illustrating candidate refinement via minimal user input. PRIME asks discrete questions to prune the candidate set until a single object remains, requests confirmation, and then issues an action tool call for execution.}
+\label{fig:interaction_example}
+\end{figure*}
+
+\subsection{LLM Executive and Tool Interface}
+\label{sec:llm_executive}
+
+PRIME uses an LLM as a high-level executive policy that maps the current symbolic state $s_t$ and memory $\mathcal{M}_t$ to exactly one structured decision per timestep. The available tool set is
+\[
+\mathcal{A}=\{\texttt{INTERACT},\ \texttt{APPROACH},\ \texttt{ALIGN\_YAW}\}.
+\]
+$\texttt{INTERACT}$ produces a short discrete query with up to five options (question, suggestion, or confirmation). Action tools are object-conditioned primitives: $\texttt{APPROACH}(o_k)$ commands a pre-grasp motion toward the selected object, and $\texttt{ALIGN\_YAW}(o_k)$ performs yaw alignment relative to the object pose. All motion generation and control are executed by an external planning stack.
+
+To ensure reliable integration with the executor and training pipeline, the LLM output is constrained to a fixed JSON schema and must contain exactly one tool call. Action tools are only valid when the target is in the current candidate set, and the set has been reduced to a single element; furthermore, PRIME requires an explicit confirmation interaction immediately before any action tool is issued. Figure~\ref{fig:interaction_example} shows how PRIME alternates between discrete interactions and tool calls as ambiguity is resolved and execution progresses.
+
+
+\section{Experiments}
+
+\subsection{Simulation}
+
+\subsection{Experimental design}
+% \subsection{Training Procedure}
+% \label{sec:training}
+
+% PRIME is trained via supervised imitation learning on synthetically generated interaction episodes in NVIDIA Isaac Sim with a Kinova Jaco2 arm. Each episode consists of a sequence of symbolic states, memory updates, simulated user responses, and oracle tool calls. We randomize object layouts (YCB objects), initial gripper poses, control modes, and joystick-driven motion patterns to generate diverse trajectories.
+
+% Supervision is provided by a heuristic oracle that encodes the intended decision logic: when multiple candidates are plausible, query the user with a valid multiple-choice prompt; when a single candidate remains, request confirmation; and when confirmed, issue the appropriate action tool conditioned on the current mode and geometry. The LLM is trained to predict the oracle tool call by minimizing the negative log-likelihood under the constrained JSON output format. We train across multiple Qwen-2.5 model sizes using the same state, memory, and tool interface to study capacity effects while holding the execution stack and interaction protocol fixed.
+
+\section{Conclusions}
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{root}
+
+\end{document}
+
+
+
+
+
+
+
